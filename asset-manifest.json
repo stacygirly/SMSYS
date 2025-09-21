@@ -1,0 +1,18 @@
+{
+  "files": {
+    "main.css": "/stacygirly/SMSYS.git/static/css/main.268a108c.css",
+    "main.js": "/stacygirly/SMSYS.git/static/js/main.3c8e8d80.js",
+    "static/js/453.ea75aa5e.chunk.js": "/stacygirly/SMSYS.git/static/js/453.ea75aa5e.chunk.js",
+    "static/media/break.gif": "/stacygirly/SMSYS.git/static/media/break.38e1663ea465eb30b69b.gif",
+    "static/media/yoga.gif": "/stacygirly/SMSYS.git/static/media/yoga.166b018cb7a6e183b760.gif",
+    "static/media/food.gif": "/stacygirly/SMSYS.git/static/media/food.15524ff4b2465d94cbf3.gif",
+    "index.html": "/stacygirly/SMSYS.git/index.html",
+    "main.268a108c.css.map": "/stacygirly/SMSYS.git/static/css/main.268a108c.css.map",
+    "main.3c8e8d80.js.map": "/stacygirly/SMSYS.git/static/js/main.3c8e8d80.js.map",
+    "453.ea75aa5e.chunk.js.map": "/stacygirly/SMSYS.git/static/js/453.ea75aa5e.chunk.js.map"
+  },
+  "entrypoints": [
+    "static/css/main.268a108c.css",
+    "static/js/main.3c8e8d80.js"
+  ]
+}

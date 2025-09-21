@@ -1,0 +1,64 @@
+.navbar-design {
+    background-color: #6264A7 !important; /* Teams Purple for navbar background */
+    box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+}
+
+.navbar-brand {
+    margin-left: 5%;
+    font-family: fantasy;
+    color: #FFFFFF; /* Ensure the brand text is white for visibility */
+}
+
+.navbar-nav {
+    margin-left: auto;
+    margin-right: 3%; /* Adjust this value to move the links more to the left */
+    display: flex;
+    align-items: center;
+}
+
+.nav-link, .dropdown-item {
+    color: #FFFFFF !important; /* White color for links */
+    transition: color 0.3s ease;
+}
+
+.nav-link:hover, .dropdown-item:hover {
+    color: #EDEDED !important; /* Light Grey on hover */
+}
+
+.navbar-nav .nav-item + .nav-item {
+    margin-left: 15px;
+}
+
+.navbar-dark .navbar-toggler {
+    border-color: rgba(255, 255, 255, 0.1);
+}
+
+/* Custom dropdown styles */
+.dropdown-menu {
+    padding: 20px;
+    padding-left: 40px;
+    margin-left: -47px;
+    background-color: #464775 !important; /* Darker Teams Purple for dropdown */
+    border: none;
+    box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+}
+
+.dropdown-item {
+    color: #FFFFFF !important; /* White text in dropdown items */
+    transition: background-color 0.3s, color 0.3s;
+}
+
+.dropdown-item:hover {
+    background-color: #5A5D8C !important; /* Slightly lighter purple on hover */
+    color: #EDEDED !important; /* Light Grey text on hover */
+}
+
+.navbar-nav .nav-link, .navbar-nav .dropdown-toggle {
+    display: flex;
+    align-items: center;
+}
+
+/* Hide the dropdown arrow */
+.navbar-nav .dropdown-toggle::after {
+    display: none;
+}

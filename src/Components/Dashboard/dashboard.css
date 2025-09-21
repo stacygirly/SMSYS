@@ -1,0 +1,234 @@
+body {
+  background-color: #2e3a47;
+}
+
+.dashboard-container {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 20px; /* Add padding for spacing */
+}
+
+.dashboard-content {
+  width: 100%;
+  max-width: 1600px;
+}
+
+.stats-section {
+  display: flex;
+  justify-content: center;
+  margin-bottom: 20px;
+}
+
+.stat-card {
+  background: #fff;
+  padding: 20px;
+  border-radius: 8px;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.2);
+  text-align: center;
+  width: 100%;
+}
+
+.charts-section {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  margin-bottom: 20px;
+  width: 100%;
+}
+
+.controls {
+  margin-top: 20px;
+  margin-bottom: 20px;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  width: 100%;
+  color: white;
+}
+
+.chart-wrapper {
+  display: flex;
+  justify-content: space-between;
+  width: 100%;
+}
+
+.chart, .pie-chart-container {
+  background: #1f2937; /* Darker background for better contrast */
+  padding: 30px;
+  border-radius: 10px;
+  box-shadow: 0 4px 10px rgba(0, 0, 0, 0.2);
+  margin: 10px;
+}
+
+.chart {
+  flex: 1 1;
+  height: 600px;
+}
+
+.pie-chart-container {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 600px;
+  width: 400px;
+}
+
+.pie-chart {
+  height: 250px;
+  width: 250px;
+}
+
+.pie-chart-info {
+  margin-top: 30px;
+  text-align: center;
+  color: white;
+}
+
+.chart-title {
+  text-align: center;
+  margin-bottom: 20px;
+  font-size: 1.5em;
+  color: #e0e6ed; /* Lighter text color */
+}
+
+.custom-datepicker {
+  padding: 5px;
+  border-radius: 4px;
+  border: 1px solid #ccc;
+  font-size: 16px;
+  background-color: #374151; /* Dark background for input */
+  color: white;
+}
+
+.react-datepicker__input-container {
+  display: flex;
+  justify-content: center;
+}
+
+.react-datepicker {
+  font-size: 14px;
+  border-radius: 8px;
+  box-shadow: 0 4px 10px rgba(0, 0, 0, 0.2);
+  background-color: #1f2937; /* Dark background for date picker */
+  border: 1px solid #555;
+}
+
+.react-datepicker__header {
+  background-color: #1f2937; /* Matching header color */
+  border-bottom: 1px solid #555;
+}
+
+.react-datepicker__current-month,
+.react-datepicker-time__header,
+.react-datepicker-year-header {
+  color: white;
+}
+
+.react-datepicker__day-name,
+.react-datepicker__day,
+.react-datepicker__time-name {
+  color: white;
+}
+
+.react-datepicker__day--selected,
+.react-datepicker__day--keyboard-selected {
+  background-color: #6366f1; /* Soft blue for selection */
+  color: white;
+}
+
+.react-datepicker__day--today {
+  background-color: #475569;
+  color: white;
+}
+/* --- Breathing Coach Modal Styles --- */
+.bc-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: none;
+  align-items: center;
+  justify-content: center;
+  z-index: 9999;
+}
+
+.bc-overlay.show {
+  display: flex;
+}
+
+.bc-modal {
+  width: 90%;
+  max-width: 520px;
+  background: #51558b;
+  color: #fff;
+  border-radius: 16px;
+  padding: 24px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+}
+
+.bc-title {
+  text-align: center;
+  font-weight: 700;
+  font-size: 20px;
+  margin-bottom: 12px;
+}
+
+.bc-stage {
+  display: grid;
+  place-items: center;
+  gap: 12px;
+  padding: 12px;
+}
+
+.bc-circle {
+  border-radius: 50%;
+  background: radial-gradient(circle at 30% 30%, #93a5ff, #6b73ff);
+  transition: width 50ms linear, height 50ms linear;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.25) inset,
+    0 8px 22px rgba(0, 0, 0, 0.2);
+}
+
+.bc-instructions {
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.bc-sub {
+  font-size: 13px;
+  opacity: 0.85;
+}
+
+.bc-actions {
+  display: flex;
+  gap: 10px;
+  justify-content: center;
+  margin-top: 12px;
+}
+
+.bc-btn {
+  border: 0;
+  padding: 10px 16px;
+  border-radius: 999px;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.bc-start {
+  background: #2ecc71;
+  color: #08321b;
+}
+
+.bc-stop {
+  background: #ffcc66;
+  color: #3a2b00;
+}
+
+.bc-close {
+  background: #e25757;
+  color: #fff;
+}
+  .relax-btn {
+    margin-left: 8px;
+    transform: translateY(-1px);
+  }

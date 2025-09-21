@@ -1,0 +1,8 @@
+.App {
+  text-align: center;
+}
+
+body {
+  --navbar-background-color: #fff;
+  --navbar-link-color: #333;
+}

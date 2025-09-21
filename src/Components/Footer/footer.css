@@ -1,0 +1,24 @@
+footer {
+  background-color: #6264A7; /* Match footer background with the updated navbar color */
+  color: white;
+  text-align: center;
+  padding: 10px;
+  padding-left: 42%;
+  position: fixed;
+  width: 100%;
+  bottom: 0;
+  left: 0;
+  margin-top: 50px; /* Adjust the value as needed */
+  box-shadow: 0 -2px 8px rgba(0, 0, 0, 0.1); /* Subtle shadow to elevate the footer visually */
+  font-size: 0.9rem; /* Slightly smaller font for footer text */
+}
+
+footer a {
+  color: black; /* Light blue for any links within the footer */
+  text-decoration: none;
+  transition: color 0.3s ease;
+}
+
+footer a:hover {
+  color: #C5CAE9; /* Slightly lighter blue on hover for links */
+}

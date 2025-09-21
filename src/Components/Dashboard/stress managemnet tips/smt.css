@@ -1,0 +1,195 @@
+.stress-management-tips-section {
+  background: #6264A7; /* Same dark background as the charts */
+  padding: 20px;
+  border-radius: 8px;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+  width: 100%;
+  max-width: 1600px; /* Adjusted to match the width of the charts */
+  margin-top: 20px;
+  margin-bottom: 70px;
+  color: white;
+}
+
+.stress-management-tips-section h3 {
+  text-align: center;
+  margin-bottom: 20px;
+  color: white;
+}
+
+.stress-management-tips-section ul {
+  list-style: none;
+  padding-left: 0;
+  margin: 0;
+  border-radius: 10px;
+}
+
+.stress-management-tips-section li {
+  display: flex;
+  align-items: flex-start;
+  background: rgb(238, 221, 221); /* Dark background for list items */
+  padding: 15px;
+  border-radius: 8px;
+  margin-bottom: 15px;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+  transition: background-color 0.3s;
+  cursor: pointer;
+  color: black; /* Text color */
+  border: black;
+}
+
+.stress-management-tips-section li:hover {
+  background-color: #6264A7 ; 
+  border: black;
+}
+
+.stress-management-tips-section li i {
+  font-size: 30px;
+  margin-right: 20px;
+  color: #007bff;
+}
+
+.stress-management-tips-section li span {
+  display: flex;
+  flex-direction: column;
+}
+
+.stress-management-tips-section li span div:first-child {
+  font-weight: bold;
+  margin-bottom: 5px;
+  font-size: 18px;
+}
+
+.stress-management-tips-section li span div:last-child {
+  color: #ccc;
+}
+
+.stress-management-tips-section p {
+  margin-top: 20px;
+  text-align: center;
+  color: white;
+}
+
+.btn {
+  display: block;
+  margin: 0 auto;
+}
+.smt-btn {
+  background-color: #007BFF;
+  color: white;
+  padding: 15px 30px;
+  font-size: 1rem;
+  border: none;
+  border-radius: 50px;
+  cursor: pointer;
+  width: 250px;
+  transition: transform 0.3s, background-color 0.3s;
+}
+
+.smt-btn:hover {
+  transform: scale(1.1); /* This makes the button grow when hovered over */
+  background-color: #0056b3;
+}
+
+/* Popup styles */
+.popup {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  animation: fadeIn 0.3s;
+}
+
+.popup-inner {
+  background: #6264A7;
+  padding: 20px;
+  border-radius: 8px;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.3);
+  text-align: center;
+  max-width: 700px;
+  width: 80%;
+  animation: slideDown 0.5s;
+}
+
+.popup-inner h4 {
+  color: white;
+  margin-bottom: 20px;
+}
+
+.exercise-card-container {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.arrow-btn {
+  background: none;
+  border: none;
+  color: white;
+  font-size: 2rem;
+  cursor: pointer;
+}
+
+.card {
+  background: #444;
+  padding: 20px;
+  border-radius: 8px;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+  width: 100%;
+  max-width: 300px;
+  color: white;
+  transition: background-color 0.3s;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.card img {
+  max-width: 100%;
+  height: auto;
+  border: #1c1e29;
+  border-radius: 8px;
+  margin-bottom: 20px;
+  
+}
+
+.card p {
+  margin: 0;
+  font-size: 16px;
+}
+
+.card:hover {
+  background-color: #555;
+}
+
+.close-btn {
+  background-color: #d9534f;
+  color: white;
+  padding: 10px 20px;
+  width: 25%;
+  border: none;
+  border-radius: 50px;
+  cursor: pointer;
+  transition: transform 0.3s, background-color 0.3s;
+  margin-top: 20px;
+}
+
+.close-btn:hover {
+  transform: scale(1.1);
+  background-color: #c9302c;
+}
+
+/* Animations */
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes slideDown {
+  from { transform: translateY(-50px); }
+  to { transform: translateY(0); }
+}

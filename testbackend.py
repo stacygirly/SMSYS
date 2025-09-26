@@ -3,8 +3,15 @@ import os
 
 # ===== Force CPU (avoid cuDNN/CUDA mismatch for LSTM inference) =====
 # Must be set BEFORE importing any tensorflow/keras submodules.
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")  # reduce TF log noise
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1") # hide all GPUs from TF
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")   # reduce TF log noise
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")  # hide all GPUs from TF
+
+# Load .env in local dev (no effect on Render; Render injects env vars)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
 
 import logging
 import tempfile
@@ -17,7 +24,6 @@ import joblib
 import librosa
 import bcrypt
 import speech_recognition as sr
-import hashlib
 
 from flask import Flask, request, jsonify, session
 from flask_cors import CORS
@@ -30,16 +36,16 @@ from bson.binary import Binary
 # Import TF AFTER env flags above; also explicitly hide GPUs.
 import tensorflow as tf
 try:
-    tf.config.set_visible_devices([], 'GPU')  # extra safety
+    tf.config.set_visible_devices([], "GPU")  # extra safety
 except Exception:
     pass
 
 from tensorflow.keras.optimizers import Nadam
 from openai import OpenAI
 
-# ===================== Deployment constants =====================
-PROD_DOMAIN = "persuasive.research.cs.dal.ca"
-API_PREFIX  = "/smsys"  # the path your API is mounted under on the prod domain
+# ===================== Deployment constants (env-overridable) =====================
+PROD_DOMAIN = os.getenv("PROD_DOMAIN", "persuasive.research.cs.dal.ca")
+API_PREFIX  = os.getenv("API_PREFIX", "/smsys")
 ALLOWED_ORIGINS = {
     "http://localhost:3000",
     "http://127.0.0.1:3000",
@@ -49,12 +55,8 @@ ALLOWED_ORIGINS = {
 
 # ===================== App & Config =====================
 app = Flask(__name__)
-app.config["SECRET_KEY"] = "b53188295937de88acf7c26a8c0a9de11c915d7e1defe86ded74dbd07ef0c5e6"
-app.config["MONGO_URI"] = (
-    "mongodb+srv://graceatagubabackups:Zjw20GyGArm5tczZ"
-    "@cluster0.txqwe0t.mongodb.net/StressDetector"
-    "?retryWrites=true&w=majority&appName=Cluster0"
-)
+app.config["SECRET_KEY"] = os.getenv("FLASK_SECRET_KEY", "dev-only-fallback")
+app.config["MONGO_URI"] = os.getenv("MONGO_URI")
 
 # Base session config; details adjusted per-request in @before_request
 app.config.update(
@@ -378,7 +380,7 @@ def log_status():
     return jsonify(entry), 200
 
 # ---- Prediction ----
-@app.route('/predict_emotion', methods=['POST'])
+@app.route("/predict_emotion", methods=["POST"])
 def predict_emotion():
     """
     Accepts an audio file (webm/ogg/wav), converts to mono 16k WAV, runs inference,
@@ -386,10 +388,10 @@ def predict_emotion():
     """
     if model is None or scaler is None:
         return jsonify({"error": "Model or scaler not loaded"}), 500
-    if 'file' not in request.files:
+    if "file" not in request.files:
         return jsonify({"error": "no file"}), 400
 
-    uploaded = request.files['file']
+    uploaded = request.files["file"]
     if not uploaded or uploaded.filename == "":
         return jsonify({"error": "empty filename"}), 400
 
@@ -439,11 +441,9 @@ def predict_emotion():
             last_features = feats
             norm = scaler.transform([feats])
 
-            # ==== Predict on CPU, quiet logging ====
-            x = np.expand_dims(norm, axis=2)   # shape (1, 38, 1) as expected by your model
+            x = np.expand_dims(norm, axis=2)  # (1, 38, 1)
             yhat = model.predict(x, verbose=0)
             pred = float(yhat[0][0])
-
             frame_preds.append(pred)
 
         mean_prediction = float(np.mean(frame_preds))
@@ -452,12 +452,12 @@ def predict_emotion():
         pace = pace_suggestion_from_pred(mean_prediction)
 
         feature_names = (
-            ['zero_crossings', 'spectral_centroid', 'spectral_bandwidth', 'spectral_rolloff'] +
-            [f'mfcc_{i+1}' for i in range(13)] +
-            [f'chroma_{i+1}' for i in range(12)] +
-            ['intensity'] +
-            [f'spectral_contrast_{i+1}' for i in range(7)] +
-            ['speech_rate']
+            ["zero_crossings", "spectral_centroid", "spectral_bandwidth", "spectral_rolloff"] +
+            [f"mfcc_{i+1}" for i in range(13)] +
+            [f"chroma_{i+1}" for i in range(12)] +
+            ["intensity"] +
+            [f"spectral_contrast_{i+1}" for i in range(7)] +
+            ["speech_rate"]
         )
         features_map = {}
         if last_features is not None and last_features.size == 38:
@@ -511,7 +511,7 @@ def predict_emotion():
                 pass
 
 # ---- Chat (requires login) ----
-client = OpenAI(api_key="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")
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 @app.route("/chat", methods=["POST"])
 @login_required
@@ -579,26 +579,19 @@ def _parse_iso(ts):
     if not ts:
         return None
     try:
-        # handle trailing Z
         if isinstance(ts, str) and ts.endswith("Z"):
             return datetime.fromisoformat(ts.replace("Z", "+00:00"))
         return datetime.fromisoformat(ts) if isinstance(ts, str) else ts
     except Exception:
         return None
 
-def _iso(dt):
-    return dt.isoformat() if isinstance(dt, datetime) else None
-
 def _jsonify_intervention(doc):
-    """Convert Mongo intervention doc to JSON-friendly dict."""
     out = dict(doc)
     if "iid" in out and isinstance(out["iid"], ObjectId):
         out["iid"] = str(out["iid"])
-    # normalize datetimes to ISO strings
     for key in ("start_time", "end_time", "stressed_detected_at"):
         if key in out and isinstance(out[key], datetime):
             out[key] = out[key].isoformat()
-    # actions list
     if isinstance(out.get("actions"), list):
         norm_actions = []
         for a in out["actions"]:
@@ -615,25 +608,12 @@ def list_interventions():
     user_id = session.get("user_id")
     user = mongo.db.users.find_one({"_id": ObjectId(user_id)}, {"_id": 0, "interventions": 1})
     items = (user or {}).get("interventions", [])
-    # newest first by start_time
     items.sort(key=lambda x: x.get("start_time", datetime.min), reverse=True)
     return jsonify([_jsonify_intervention(it) for it in items]), 200
 
 @app.route("/interventions/start", methods=["POST"])
 @login_required
 def intervention_start():
-    """
-    Body:
-    {
-      "type": "breathing" | "break" | "dietVoice" | "chatbot",
-      "emotion_at_trigger": "stressed" | "not stressed",
-      "model_prediction": 0..1,
-      "confidence": 0..1,
-      "pace": "pace_up" | "pace_down" | "steady",
-      "stressed_detected_at": ISO8601 string (optional),
-      "note": "optional"
-    }
-    """
     user_id = session.get("user_id")
     data = request.json or {}
 
@@ -645,7 +625,6 @@ def intervention_start():
     if emotion_at_trigger not in ("stressed", "not stressed"):
         return jsonify({"message": "emotion_at_trigger must be 'stressed' or 'not stressed'"}), 400
 
-    # optional
     model_prediction = float(data.get("model_prediction")) if data.get("model_prediction") is not None else None
     confidence       = float(data.get("confidence")) if data.get("confidence") is not None else None
     pace             = data.get("pace") or None
@@ -667,7 +646,7 @@ def intervention_start():
         "confidence": confidence,
         "pace": pace,
         "stressed_detected_at": stressed_at,
-        "actions": [],         # [{at, action, meta}]
+        "actions": [],
         "note": note,
         "source": "ui",
     }
@@ -682,15 +661,6 @@ def intervention_start():
 @app.route("/interventions/action", methods=["POST"])
 @login_required
 def intervention_action():
-    """
-    Log a click/step within an intervention.
-    Body:
-    {
-      "iid": "<string id returned by /interventions/start>",
-      "action": "start" | "stop" | "openBot" | "close" | "breathing_start" | "breathing_stop" | "...",
-      "meta": { ... }   # optional
-    }
-    """
     user_id = session.get("user_id")
     data = request.json or {}
     iid = data.get("iid")
@@ -720,15 +690,6 @@ def intervention_action():
 @app.route("/interventions/finish", methods=["POST"])
 @login_required
 def intervention_finish():
-    """
-    Mark as finished/dismissed and store duration.
-    Body:
-    {
-      "iid": "<string>",
-      "outcome": "completed" | "dismissed" | "skipped",
-      "duration_ms": number (optional; server computes if omitted)
-    }
-    """
     user_id = session.get("user_id")
     data = request.json or {}
     iid = data.get("iid")
@@ -745,7 +706,6 @@ def intervention_finish():
 
     now = datetime.now(timezone.utc)
 
-    # fetch to compute server duration if needed
     doc = mongo.db.users.find_one(
         {"_id": ObjectId(user_id), "interventions.iid": aid},
         {"interventions.$": 1}

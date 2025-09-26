@@ -51,6 +51,7 @@ ALLOWED_ORIGINS = {
     "http://127.0.0.1:3000",
     "https://persuasive.research.cs.dal.ca",
     "https://stacygirly.github.io",
+    "https://smsys.onrender.com",
 }
 
 # ===================== App & Config =====================

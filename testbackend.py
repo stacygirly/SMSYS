@@ -1,11 +1,12 @@
-# backend.py  (drop-in replacement for your testbackend.py)
+# backend.py
 import os
 
 # ===== Force CPU (avoid cuDNN/CUDA mismatch for LSTM inference) =====
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
+# Must be set BEFORE importing any tensorflow/keras submodules.
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")   # reduce TF log noise
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")  # hide all GPUs from TF
 
-# Load .env in local dev (Render injects env vars)
+# Load .env in local dev (no effect on Render; Render injects env vars)
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -32,49 +33,52 @@ from flask_session import Session
 from bson.objectid import ObjectId
 from bson.binary import Binary
 
-# Import TF AFTER env flags above
+# Import TF AFTER env flags above; also explicitly hide GPUs.
 import tensorflow as tf
 try:
-    tf.config.set_visible_devices([], "GPU")
+    tf.config.set_visible_devices([], "GPU")  # extra safety
 except Exception:
     pass
 
 from tensorflow.keras.optimizers import Nadam
 from openai import OpenAI
 
-# ===================== Deployment constants =====================
+# ===================== Deployment constants (env-overridable) =====================
 PROD_DOMAIN = os.getenv("PROD_DOMAIN", "persuasive.research.cs.dal.ca")
 API_PREFIX  = os.getenv("API_PREFIX", "/smsys")
 ALLOWED_ORIGINS = {
+    # local dev
     "http://localhost:3000",
     "http://127.0.0.1:3000",
     "http://localhost:5173",
+    # prod web
     "https://persuasive.research.cs.dal.ca",
     "https://stacygirly.github.io",
-    "https://smsys.onrender.com",   # backend host; harmless to include
+    # backend host itself (harmless to include)
+    "https://smsys.onrender.com",
 }
 
 # ===================== App & Config =====================
 app = Flask(__name__)
-app.url_map.strict_slashes = False  # accept both /route and /route/
+app.url_map.strict_slashes = False  # accept /@me and /@me/
 app.config["SECRET_KEY"] = os.getenv("FLASK_SECRET_KEY", "dev-only-fallback")
 app.config["MONGO_URI"] = os.getenv("MONGO_URI")
 
-# Base session config; adjusted dynamically per request
+# Base session config; details adjusted per-request in @before_request
 app.config.update(
     SESSION_TYPE="filesystem",
     SESSION_PERMANENT=False,
     SESSION_USE_SIGNER=True,
     SESSION_COOKIE_NAME="session",
     SESSION_COOKIE_HTTPONLY=True,
-    SESSION_COOKIE_SAMESITE="Lax",    # default (local)
-    SESSION_COOKIE_SECURE=False,      # default (local)
-    SESSION_COOKIE_PATH="/",          # default (local)
-    SESSION_COOKIE_DOMAIN=None,       # default (local)
+    SESSION_COOKIE_SAMESITE="Lax",  # local default; adjusted dynamically below
+    SESSION_COOKIE_SECURE=False,    # local default; adjusted dynamically below
+    SESSION_COOKIE_PATH="/",        # local default; adjusted dynamically below
+    SESSION_COOKIE_DOMAIN=None,     # local default; adjusted dynamically below
 )
 Session(app)
 
-# CORS – allow credentials and echo exact origin in after_request
+# CORS – allow credentials and echo exact origin later in after_request
 CORS(
     app,
     supports_credentials=True,
@@ -84,6 +88,7 @@ CORS(
     expose_headers=["Content-Type", "Authorization"],
 )
 
+# Echo precise origin + credentials
 @app.after_request
 def add_cors_headers(resp):
     origin = request.headers.get("Origin")
@@ -95,28 +100,40 @@ def add_cors_headers(resp):
         resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,DELETE,OPTIONS"
     return resp
 
-# Dynamically scope cookie (prod vs Render vs local)
+# Accept ALL preflights with a clean 204 (prevents odd 30x behavior)
+@app.route("/", methods=["OPTIONS"])
+def cors_root():
+    return ("", 204)
+
+@app.route("/<path:_unused>", methods=["OPTIONS"])
+def cors_preflight(_unused):
+    return ("", 204)
+
+# Dynamically scope cookie for prod and Render (cross-site cookie for SPA → API)
 @app.before_request
 def _scope_session_cookie():
     host = (request.host or "").split(":")[0]
     is_prod   = host.endswith(PROD_DOMAIN)
-    is_render = host.endswith(".onrender.com")  # smsys.onrender.com
+    is_render = host.endswith(".onrender.com")  # e.g., smsys.onrender.com
 
     if is_prod:
+        # prod behind /smsys
         app.config.update(
             SESSION_COOKIE_SAMESITE="None",
             SESSION_COOKIE_SECURE=True,
             SESSION_COOKIE_DOMAIN=PROD_DOMAIN,
-            SESSION_COOKIE_PATH=API_PREFIX,  # API behind /smsys
+            SESSION_COOKIE_PATH=API_PREFIX,
         )
     elif is_render:
+        # Render: host-only cookie at root path
         app.config.update(
             SESSION_COOKIE_SAMESITE="None",
             SESSION_COOKIE_SECURE=True,
-            SESSION_COOKIE_DOMAIN=None,      # host-only cookie
+            SESSION_COOKIE_DOMAIN=None,
             SESSION_COOKIE_PATH="/",
         )
     else:
+        # Local dev
         app.config.update(
             SESSION_COOKIE_SAMESITE="Lax",
             SESSION_COOKIE_SECURE=False,
@@ -124,15 +141,10 @@ def _scope_session_cookie():
             SESSION_COOKIE_PATH="/",
         )
 
-# Optional: preflight handler so proxies never 307/308 on OPTIONS
-@app.route("/<path:_>", methods=["OPTIONS"])
-def cors_preflight(_):
-    return ("", 204)
-
 # ===================== Logging =====================
 class CustomFormatter(logging.Formatter):
     def format(self, record):
-        return f"{record.levelname}: {record.getMessage()}"
+        return f"{record.levelname}: {record.message}"
 
 handler = logging.StreamHandler()
 handler.setFormatter(CustomFormatter())
@@ -154,17 +166,12 @@ except Exception as e:
 # ===================== Login Manager =====================
 login_manager = LoginManager()
 login_manager.init_app(app)
+login_manager.login_view = "login"
 
-# IMPORTANT: do NOT set login_view for APIs (it forces HTML redirects)
-# login_manager.login_view = "login"
-
+# Return JSON 401 (no redirects)
 @login_manager.unauthorized_handler
 def unauthorized():
     return jsonify({"message": "Not logged in"}), 401
-
-@login_manager.needs_refresh_handler
-def needs_refresh():
-    return jsonify({"message": "Session refresh required"}), 401
 
 class User(UserMixin):
     def __init__(self, user_id, username, password):
@@ -301,7 +308,7 @@ def get_current_user_route():
     user = mongo.db.users.find_one({"_id": ObjectId(user_id)})
     return jsonify({"id": str(user["_id"]), "username": user["username"], "message": "Session active"})
 
-@app.route("/me")
+@app.route("/me")  # alias
 def get_current_user_alias():
     return get_current_user_route()
 
@@ -309,6 +316,7 @@ def get_current_user_alias():
 def logout_user():
     session.clear()
     resp = jsonify({"message": "Logged out"})
+    # delete cookie with correct scope depending on env
     host = (request.host or "").split(":")[0]
     if host.endswith(PROD_DOMAIN):
         resp.delete_cookie(
@@ -592,7 +600,7 @@ def stress_dashboard():
     data.sort(key=lambda e: e.get("timestamp", ""), reverse=True)
     return jsonify(data), 200
 
-# ===================== Interventions =====================
+# ===================== Interventions (NEW) =====================
 ALLOWED_INTERVENTIONS = {"breathing", "break", "dietVoice", "chatbot"}
 
 def _parse_iso(ts):
@@ -752,7 +760,7 @@ def intervention_finish():
     )
     return jsonify({"ok": True, "end_time": now.isoformat(), "duration_ms": duration_ms}), 200
 
-# ---- Debug helper ----
+# ---- Debug helper (optional) ----
 @app.route("/debug/cookies")
 def debug_cookies():
     return jsonify({

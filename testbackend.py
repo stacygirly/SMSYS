@@ -1,14 +1,12 @@
 # backend.py
 import os
 
-# ===== Force CPU + keep TF quiet =====
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
-# keep TF threads tiny for small instances
-os.environ.setdefault("TF_NUM_INTEROP_THREADS", "1")
-os.environ.setdefault("TF_NUM_INTRAOP_THREADS", "1")
+# ===== Force CPU (avoid cuDNN/CUDA mismatch for LSTM inference) =====
+# Must be set BEFORE importing any tensorflow/keras submodules.
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")   # reduce TF log noise
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")  # hide all GPUs from TF
 
-# Load .env in local dev
+# Load .env in local dev (Render injects env vars automatically)
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -17,7 +15,10 @@ except Exception:
 
 import logging
 import tempfile
+import shutil
+import subprocess
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 import numpy as np
 import joblib
@@ -33,31 +34,24 @@ from flask_session import Session
 from bson.objectid import ObjectId
 from bson.binary import Binary
 
+# Import TF AFTER env flags above; also explicitly hide GPUs.
 import tensorflow as tf
 try:
-    tf.config.set_visible_devices([], "GPU")
-except Exception:
-    pass
-try:
-    tf.config.threading.set_inter_op_parallelism_threads(1)
-    tf.config.threading.set_intra_op_parallelism_threads(1)
+    tf.config.set_visible_devices([], "GPU")  # extra safety
 except Exception:
     pass
 
 from tensorflow.keras.optimizers import Nadam
 from openai import OpenAI
 
-# ===================== Deployment constants =====================
+# ===================== Deployment constants (env-overridable) =====================
 PROD_DOMAIN = os.getenv("PROD_DOMAIN", "persuasive.research.cs.dal.ca")
-API_PREFIX  = os.getenv("API_PREFIX", "/")
+API_PREFIX  = os.getenv("API_PREFIX", "/smsys")
 ALLOWED_ORIGINS = {
-    # local dev
     "http://localhost:3000",
     "http://127.0.0.1:3000",
-    # your sites
     "https://stacygirly.github.io",
     "https://persuasive.research.cs.dal.ca",
-    # render backend itself (for same-site usage)
     "https://smsys.onrender.com",
 }
 
@@ -66,21 +60,21 @@ app = Flask(__name__)
 app.config["SECRET_KEY"] = os.getenv("FLASK_SECRET_KEY", "dev-only-fallback")
 app.config["MONGO_URI"] = os.getenv("MONGO_URI")
 
-# sessions
+# Base session config; details adjusted per-request in @before_request
 app.config.update(
     SESSION_TYPE="filesystem",
     SESSION_PERMANENT=False,
     SESSION_USE_SIGNER=True,
     SESSION_COOKIE_NAME="session",
     SESSION_COOKIE_HTTPONLY=True,
-    SESSION_COOKIE_SAMESITE="Lax",
-    SESSION_COOKIE_SECURE=False,
-    SESSION_COOKIE_PATH="/",
-    SESSION_COOKIE_DOMAIN=None,
+    SESSION_COOKIE_SAMESITE="Lax",   # default; may switch to None dynamically
+    SESSION_COOKIE_SECURE=False,     # default; may switch to True dynamically
+    SESSION_COOKIE_PATH="/",         # default path; safe for Render root
+    SESSION_COOKIE_DOMAIN=None,      # host-only is safest
 )
 Session(app)
 
-# CORS
+# CORS – allow credentials; exact origin echoed in @after_request
 CORS(
     app,
     supports_credentials=True,
@@ -90,6 +84,7 @@ CORS(
     expose_headers=["Content-Type", "Authorization"],
 )
 
+# Echo precise origin + credentials
 @app.after_request
 def add_cors_headers(resp):
     origin = request.headers.get("Origin")
@@ -101,23 +96,39 @@ def add_cors_headers(resp):
         resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,DELETE,OPTIONS"
     return resp
 
-# Scope cookie for Render subdomain or prod
+# Dynamically scope cookie for same-site vs cross-site requests
 @app.before_request
 def _scope_session_cookie():
-    host = (request.host or "").split(":")[0]
-    if host.endswith("onrender.com") or host.endswith(PROD_DOMAIN):
-        app.config.update(
-            SESSION_COOKIE_SAMESITE="None",
-            SESSION_COOKIE_SECURE=True,
-            SESSION_COOKIE_DOMAIN=host,   # send cookie to this exact host
-            SESSION_COOKIE_PATH="/",
-        )
-    else:
+    """
+    If the frontend is on a different site (GitHub Pages, Dal domain),
+    set cookie to SameSite=None; Secure so the browser sends it cross-site.
+    """
+    host = (request.host or "").split(":")[0]     # e.g., smsys.onrender.com
+    origin = request.headers.get("Origin")
+    same_site = False
+
+    if origin:
+        try:
+            ohost = urlparse(origin).hostname or ""
+            same_site = (ohost == host) or ohost.endswith("." + host)
+        except Exception:
+            same_site = False
+
+    if same_site:
+        # Same-site: normal lax/insecure (works in local dev too)
         app.config.update(
             SESSION_COOKIE_SAMESITE="Lax",
             SESSION_COOKIE_SECURE=False,
             SESSION_COOKIE_DOMAIN=None,
             SESSION_COOKIE_PATH="/",
+        )
+    else:
+        # Cross-site: must be None + Secure (required by browsers)
+        app.config.update(
+            SESSION_COOKIE_SAMESITE="None",
+            SESSION_COOKIE_SECURE=True,
+            SESSION_COOKIE_DOMAIN=None,  # host-only cookie
+            SESSION_COOKIE_PATH="/",     # use "/" for Render root
         )
 
 # ===================== Logging =====================
@@ -134,7 +145,11 @@ logging.getLogger("pymongo").setLevel(logging.ERROR)
 
 # ===================== Mongo =====================
 mongo = PyMongo(app)
-mongo.db.users.create_index("username", unique=True)
+try:
+    mongo.db.users.create_index("username", unique=True)
+except Exception:
+    pass
+
 try:
     mongo.cx.server_info()
     print("✅ Connected to MongoDB successfully")
@@ -146,6 +161,7 @@ login_manager = LoginManager()
 login_manager.init_app(app)
 login_manager.login_view = "login"
 
+# Return JSON 401 (no redirects)
 @login_manager.unauthorized_handler
 def unauthorized():
     return jsonify({"message": "Not logged in"}), 401
@@ -179,7 +195,18 @@ except Exception as e:
 
 recognizer = sr.Recognizer()
 
-# ===================== Feature extraction =====================
+# ===================== Audio Utils =====================
+FFMPEG = shutil.which("ffmpeg") or "ffmpeg"
+
+def _ffmpeg_to_wav(src_path, dst_path):
+    cmd = [
+        FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
+        "-i", src_path, "-ac", "1", "-ar", "16000", dst_path
+    ]
+    proc = subprocess.run(cmd, capture_output=True)
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.decode("utf-8", errors="ignore") or "ffmpeg failed")
+
 def extract_features(y, sr):
     try:
         zero_crossings = np.mean(librosa.feature.zero_crossing_rate(y=y))
@@ -274,7 +301,7 @@ def get_current_user_route():
     user = mongo.db.users.find_one({"_id": ObjectId(user_id)})
     return jsonify({"id": str(user["_id"]), "username": user["username"], "message": "Session active"})
 
-@app.route("/me")
+@app.route("/me")  # alias
 def get_current_user_alias():
     return get_current_user_route()
 
@@ -282,17 +309,21 @@ def get_current_user_alias():
 def logout_user():
     session.clear()
     resp = jsonify({"message": "Logged out"})
+    # Delete cookie; mirror current cookie attributes so browsers remove it
+    origin = request.headers.get("Origin")
     host = (request.host or "").split(":")[0]
-    if host.endswith("onrender.com") or host.endswith(PROD_DOMAIN):
-        resp.delete_cookie(
-            key="session",
-            path="/",
-            domain=host,
-            samesite="None",
-            secure=True,
-        )
-    else:
+    same_site = False
+    if origin:
+        try:
+            ohost = urlparse(origin).hostname or ""
+            same_site = (ohost == host) or ohost.endswith("." + host)
+        except Exception:
+            same_site = False
+
+    if same_site:
         resp.delete_cookie("session", path="/")
+    else:
+        resp.delete_cookie("session", path="/", samesite="None", secure=True)
     return resp, 200
 
 @app.route("/update_username", methods=["POST"])
@@ -370,16 +401,15 @@ def log_status():
     )
     return jsonify(entry), 200
 
-# ---- Prediction (WAV ONLY) ----
+# ---- Prediction ----
 @app.route("/predict_emotion", methods=["POST"])
 def predict_emotion():
     """
-    Accepts a WAV file (16 kHz mono) and runs inference.
-    If a non-WAV is posted, returns 415 with {"error":"send_wav_only"}.
+    Accepts an audio file (webm/ogg/wav), converts to mono 16k WAV, runs inference,
+    logs the result for the current user, and returns JSON.
     """
     if model is None or scaler is None:
         return jsonify({"error": "Model or scaler not loaded"}), 500
-
     if "file" not in request.files:
         return jsonify({"error": "no file"}), 400
 
@@ -389,20 +419,31 @@ def predict_emotion():
 
     name_lower = (uploaded.filename or "").lower()
     mt = (uploaded.mimetype or "").lower()
-    is_wav = name_lower.endswith(".wav") or "wav" in mt or "wave" in mt
-    if not is_wav:
-        return jsonify({"error": "send_wav_only", "detail": "Please upload WAV (mono, 16kHz)."}), 415
+    suffix = ".webm"
+    if name_lower.endswith(".ogg") or "ogg" in mt:
+        suffix = ".ogg"
+    if name_lower.endswith(".wav") or "wav" in mt or "wave" in mt:
+        suffix = ".wav"
 
-    tmp_wav = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-    tmp_wav.close()
+    upload_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    wav_tmp    = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+    upload_tmp.close()
+    wav_tmp.close()
 
     try:
-        uploaded.save(tmp_wav.name)
-        if os.path.getsize(tmp_wav.name) < 1500:
+        uploaded.save(upload_tmp.name)
+        if os.path.getsize(upload_tmp.name) < 1500:
             raise RuntimeError("Uploaded file too small (likely truncated).")
 
-        # Load and resample to 16k mono just in case
-        y, sr = librosa.load(tmp_wav.name, sr=16000, mono=True)
+        try:
+            _ffmpeg_to_wav(upload_tmp.name, wav_tmp.name)
+        except Exception as fferr:
+            if suffix == ".wav":
+                shutil.copyfile(upload_tmp.name, wav_tmp.name)
+            else:
+                raise RuntimeError(str(fferr))
+
+        y, sr = librosa.load(wav_tmp.name, sr=None, mono=True)
         if y is None or y.size == 0:
             raise RuntimeError("Decoded audio is empty.")
 
@@ -484,11 +525,12 @@ def predict_emotion():
         app.logger.exception("predict_emotion crashed")
         return jsonify({"error": "server_error", "detail": str(e)}), 500
     finally:
-        try:
-            if os.path.exists(tmp_wav.name):
-                os.remove(tmp_wav.name)
-        except Exception:
-            pass
+        for p in (upload_tmp.name, wav_tmp.name):
+            try:
+                if p and os.path.exists(p):
+                    os.remove(p)
+            except Exception:
+                pass
 
 # ---- Chat (requires login) ----
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -536,7 +578,7 @@ def get_chats():
 def get_user_emotions():
     user_id = session.get("user_id")
     if not user_id:
-        return jsonify([]), 200
+        return jsonify({"message": "Not logged in"}), 401
     user = mongo.db.users.find_one({"_id": ObjectId(user_id)}, {"_id": 0, "emotions": 1})
     emotions = user.get("emotions", []) if user else []
     emotions.sort(key=lambda e: e.get("timestamp", ""), reverse=True)
@@ -546,7 +588,7 @@ def get_user_emotions():
 def stress_dashboard():
     user_id = session.get("user_id")
     if not user_id:
-        return jsonify([]), 200
+        return jsonify({"message": "Not logged in"}), 401
     user = mongo.db.users.find_one({"_id": ObjectId(user_id)}, {"_id": 0, "emotions": 1})
     data = user.get("emotions", []) if user else []
     data.sort(key=lambda e: e.get("timestamp", ""), reverse=True)
@@ -653,7 +695,11 @@ def intervention_action():
     except Exception:
         return jsonify({"message": "Invalid iid"}), 400
 
-    evt = {"at": datetime.now(timezone.utc), "action": action, "meta": data.get("meta") or {}}
+    evt = {
+        "at": datetime.now(timezone.utc),
+        "action": action,
+        "meta": data.get("meta") or {}
+    }
 
     result = mongo.db.users.update_one(
         {"_id": ObjectId(user_id), "interventions.iid": aid},
@@ -718,6 +764,6 @@ def debug_cookies():
         "path": request.path,
     })
 
-# ===================== Run (dev only) =====================
+# ===================== Run =====================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)

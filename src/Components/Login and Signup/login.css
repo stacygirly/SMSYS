@@ -1,0 +1,162 @@
+@import url('https://fonts.googleapis.com/css2?family=Roboto:wght@400;700&display=swap');
+
+body {
+    margin: 0;
+    padding: 0;
+    font-family: 'Roboto', sans-serif;
+    background: linear-gradient(145deg, #F0F4FF, #FFFFFF); /* Soft gradient background */
+}
+
+.app {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+    min-height: 100vh;
+    background: none; /* Allow body background to show */
+}
+
+.login-page {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    width: 100%;
+    padding: 20px;
+    height: 94vh;
+    background-color: white;
+}
+
+.login-container {
+    display: flex;
+    margin-top: 5%;
+    background: #FFFFFF; /* Light background */
+    box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2);
+    border-radius: 10px;
+    overflow: hidden;
+    max-width: 900px;
+    width: 100%;
+    color: #333333; /* Darker text */
+    transition: transform 0.3s ease, box-shadow 0.3s ease;
+}
+
+.login-container:hover {
+    transform: scale(1.02);
+    box-shadow: 0 8px 20px rgba(0, 0, 0, 0.3);
+}
+
+.login-form, .login-welcome {
+    padding: 40px;
+    width: 50%;
+    box-sizing: border-box;
+}
+
+.login-form {
+    background: #F3F4F6; /* Light gray for form */
+    color: #333333; /* Darker text */
+}
+
+.login-welcome {
+    background: linear-gradient(to right, #6264A7, #4545ee); /* Gradient matching the rest of the theme */
+    color: #fff;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+}
+
+.login-form h2, .login-welcome h2 {
+    margin-bottom: 20px;
+    font-size: 24px;
+    font-weight: 400;
+}
+
+.form-group {
+    margin-bottom: 20px;
+    position: relative;
+}
+
+.form-group input {
+    width: 100%;
+    padding: 10px;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    box-sizing: border-box;
+    font-size: 14px;
+    background: #E0E0E0; /* Light background for input */
+    color: #333333; /* Darker text */
+}
+
+.form-group input::placeholder {
+    color: #888;
+}
+
+.form-group button {
+    width: 100%;
+    padding: 10px;
+    background: #6264A7; /* Consistent button color */
+    border: none;
+    border-radius: 4px;
+    color: #fff;
+    cursor: pointer;
+    font-size: 16px;
+    transition: background-color 0.3s, transform 0.3s;
+}
+
+.form-group button:hover {
+    background: #2C3E75; /* Slightly darker on hover */
+    transform: scale(1.05);
+}
+
+.form-group a {
+    display: flex;
+    align-items: center;
+    font-size: 14px;
+    cursor: pointer;
+    color: #6264A7;
+}
+
+.form-group .forgot-password {
+    display: block;
+    margin-top: 10px;
+    font-size: 14px;
+    color: #3F51B5;
+    text-align: right;
+}
+
+.forgot-password:hover {
+    text-decoration: underline;
+}
+
+.error {
+    color: red;
+    font-size: 12px;
+}
+
+.sign-up-button {
+    background: #fff;
+    color: #3F51B5;
+    padding: 10px 20px;
+    border: 1px solid #fff;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 16px;
+    width: 100%;
+    transition: background-color 0.3s, transform 0.3s;
+}
+
+.sign-up-button:hover {
+    background: #6264A7;
+    color: #fff;
+    transform: scale(1.05);
+}
+
+.remember {
+    display: flex;
+    align-items: center;
+    margin-top: 10px;
+    color: #333333; /* Darker text */
+}
+
+p {
+    display: flex;
+}

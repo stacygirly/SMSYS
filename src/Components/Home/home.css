@@ -1,0 +1,66 @@
+@import url('https://fonts.googleapis.com/css2?family=Roboto:wght@400;700&display=swap');
+
+body {
+    font-family: 'Roboto', sans-serif;
+    background: linear-gradient(145deg, #F0F4FF, #FFFFFF); /* Soft gradient background for the entire body */
+    color: #333333; /* Default text color */
+}
+
+.navbar-design {
+    background-color: #3F51B5 !important; /* A slightly brighter shade of Teams Purple for better contrast */
+    box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+}
+
+.navbar-brand {
+    color: #FFFFFF; /* White text for brand */
+    margin-left: 5%;
+    font-family: fantasy;
+}
+
+.nav-link, .dropdown-item {
+    color: #FFFFFF !important; /* White links for better contrast */
+    transition: color 0.3s ease;
+}
+
+.nav-link:hover, .dropdown-item:hover {
+    color: #E8EAF6 !important; /* Light blue on hover */
+}
+
+.home-container {
+    display: flex;
+    flex-direction: column;
+    background: none; /* Remove specific background color to allow the body gradient to show */
+    justify-content: center;
+    align-items: center;
+    height: 90vh;
+    text-align: center;
+}
+
+.home-container h1 {
+    color: #3F51B5; /* Darker blue to match the updated navbar */
+    font-size: 3rem;
+    margin-bottom: 20px;
+}
+
+.home-container p {
+    color: #5C6BC0; /* Softer blue that complements the navbar and heading */
+    font-size: 1.2rem;
+    margin-bottom: 40px;
+}
+
+.learn-more-button {
+    background-color: #5C6BC0; /* Consistent bright blue for button */
+    color: white;
+    padding: 15px 30px;
+    font-size: 1rem;
+    border: none;
+    border-radius: 50px;
+    cursor: pointer;
+    width: 200px;
+    transition: transform 0.3s, background-color 0.3s;
+}
+
+.learn-more-button:hover {
+    transform: scale(1.1); /* This makes the button grow when hovered over */
+    background-color: #005A9E; /* Darker blue on hover */
+}

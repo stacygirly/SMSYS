@@ -1,4 +1,4 @@
-# backend.py
+# testbackend.py
 import os
 
 # ===== Force CPU (avoid cuDNN/CUDA mismatch for LSTM inference) =====
@@ -49,9 +49,10 @@ API_PREFIX  = os.getenv("API_PREFIX", "/smsys")
 ALLOWED_ORIGINS = {
     "http://localhost:3000",
     "http://127.0.0.1:3000",
+    "http://localhost:5173",
     "https://persuasive.research.cs.dal.ca",
     "https://stacygirly.github.io",
-    "https://smsys.onrender.com",
+    "https://smsys.onrender.com",   # backend host; harmless to include
 }
 
 # ===================== App & Config =====================
@@ -66,10 +67,10 @@ app.config.update(
     SESSION_USE_SIGNER=True,
     SESSION_COOKIE_NAME="session",
     SESSION_COOKIE_HTTPONLY=True,
-    SESSION_COOKIE_SAMESITE="Lax",  # local default; prod is set to None dynamically
-    SESSION_COOKIE_SECURE=False,    # local default; prod True dynamically
-    SESSION_COOKIE_PATH="/",        # local default; prod /smsys dynamically
-    SESSION_COOKIE_DOMAIN=None,     # local default; prod domain dynamically
+    SESSION_COOKIE_SAMESITE="Lax",  # local default; adjusted dynamically below
+    SESSION_COOKIE_SECURE=False,    # local default; adjusted dynamically below
+    SESSION_COOKIE_PATH="/",        # local default; adjusted dynamically below
+    SESSION_COOKIE_DOMAIN=None,     # local default; adjusted dynamically below
 )
 Session(app)
 
@@ -95,17 +96,28 @@ def add_cors_headers(resp):
         resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,DELETE,OPTIONS"
     return resp
 
-# Dynamically scope cookie to prod domain/path (so browser sends it to /smsys)
+# Dynamically scope cookie for prod and Render (cross-site cookie for SPA → API)
 @app.before_request
 def _scope_session_cookie():
     host = (request.host or "").split(":")[0]
-    if host.endswith(PROD_DOMAIN):
-        # Cross-site capable cookie for SPA → API
+    is_prod   = host.endswith(PROD_DOMAIN)
+    is_render = host.endswith(".onrender.com")  # e.g., smsys.onrender.com
+
+    if is_prod:
+        # prod behind /smsys
         app.config.update(
             SESSION_COOKIE_SAMESITE="None",
             SESSION_COOKIE_SECURE=True,
             SESSION_COOKIE_DOMAIN=PROD_DOMAIN,
             SESSION_COOKIE_PATH=API_PREFIX,
+        )
+    elif is_render:
+        # Render: host-only cookie at root path
+        app.config.update(
+            SESSION_COOKIE_SAMESITE="None",
+            SESSION_COOKIE_SECURE=True,
+            SESSION_COOKIE_DOMAIN=None,
+            SESSION_COOKIE_PATH="/",
         )
     else:
         # Local dev
@@ -301,6 +313,8 @@ def logout_user():
             samesite="None",
             secure=True,
         )
+    elif host.endswith(".onrender.com"):
+        resp.delete_cookie("session", path="/", samesite="None", secure=True)
     else:
         resp.delete_cookie("session", path="/")
     return resp, 200

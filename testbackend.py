@@ -1,4 +1,4 @@
-# testbackend.py
+# backend.py
 import os
 
 # ===== Force CPU (avoid cuDNN/CUDA mismatch for LSTM inference) =====
@@ -6,7 +6,7 @@ import os
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")   # reduce TF log noise
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")  # hide all GPUs from TF
 
-# Load .env in local dev (no effect on Render; Render injects env vars)
+# Load .env in local dev (Render injects env vars automatically)
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -18,6 +18,7 @@ import tempfile
 import shutil
 import subprocess
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 import numpy as np
 import joblib
@@ -49,10 +50,9 @@ API_PREFIX  = os.getenv("API_PREFIX", "/smsys")
 ALLOWED_ORIGINS = {
     "http://localhost:3000",
     "http://127.0.0.1:3000",
-    "http://localhost:5173",
-    "https://persuasive.research.cs.dal.ca",
     "https://stacygirly.github.io",
-    "https://smsys.onrender.com",   # backend host; harmless to include
+    "https://persuasive.research.cs.dal.ca",
+    "https://smsys.onrender.com",
 }
 
 # ===================== App & Config =====================
@@ -67,14 +67,14 @@ app.config.update(
     SESSION_USE_SIGNER=True,
     SESSION_COOKIE_NAME="session",
     SESSION_COOKIE_HTTPONLY=True,
-    SESSION_COOKIE_SAMESITE="Lax",  # local default; adjusted dynamically below
-    SESSION_COOKIE_SECURE=False,    # local default; adjusted dynamically below
-    SESSION_COOKIE_PATH="/",        # local default; adjusted dynamically below
-    SESSION_COOKIE_DOMAIN=None,     # local default; adjusted dynamically below
+    SESSION_COOKIE_SAMESITE="Lax",   # default; may switch to None dynamically
+    SESSION_COOKIE_SECURE=False,     # default; may switch to True dynamically
+    SESSION_COOKIE_PATH="/",         # default path; safe for Render root
+    SESSION_COOKIE_DOMAIN=None,      # host-only is safest
 )
 Session(app)
 
-# CORS – allow credentials and echo exact origin later in after_request
+# CORS – allow credentials; exact origin echoed in @after_request
 CORS(
     app,
     supports_credentials=True,
@@ -96,36 +96,39 @@ def add_cors_headers(resp):
         resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,DELETE,OPTIONS"
     return resp
 
-# Dynamically scope cookie for prod and Render (cross-site cookie for SPA → API)
+# Dynamically scope cookie for same-site vs cross-site requests
 @app.before_request
 def _scope_session_cookie():
-    host = (request.host or "").split(":")[0]
-    is_prod   = host.endswith(PROD_DOMAIN)
-    is_render = host.endswith(".onrender.com")  # e.g., smsys.onrender.com
+    """
+    If the frontend is on a different site (GitHub Pages, Dal domain),
+    set cookie to SameSite=None; Secure so the browser sends it cross-site.
+    """
+    host = (request.host or "").split(":")[0]     # e.g., smsys.onrender.com
+    origin = request.headers.get("Origin")
+    same_site = False
 
-    if is_prod:
-        # prod behind /smsys
-        app.config.update(
-            SESSION_COOKIE_SAMESITE="None",
-            SESSION_COOKIE_SECURE=True,
-            SESSION_COOKIE_DOMAIN=PROD_DOMAIN,
-            SESSION_COOKIE_PATH=API_PREFIX,
-        )
-    elif is_render:
-        # Render: host-only cookie at root path
-        app.config.update(
-            SESSION_COOKIE_SAMESITE="None",
-            SESSION_COOKIE_SECURE=True,
-            SESSION_COOKIE_DOMAIN=None,
-            SESSION_COOKIE_PATH="/",
-        )
-    else:
-        # Local dev
+    if origin:
+        try:
+            ohost = urlparse(origin).hostname or ""
+            same_site = (ohost == host) or ohost.endswith("." + host)
+        except Exception:
+            same_site = False
+
+    if same_site:
+        # Same-site: normal lax/insecure (works in local dev too)
         app.config.update(
             SESSION_COOKIE_SAMESITE="Lax",
             SESSION_COOKIE_SECURE=False,
             SESSION_COOKIE_DOMAIN=None,
             SESSION_COOKIE_PATH="/",
+        )
+    else:
+        # Cross-site: must be None + Secure (required by browsers)
+        app.config.update(
+            SESSION_COOKIE_SAMESITE="None",
+            SESSION_COOKIE_SECURE=True,
+            SESSION_COOKIE_DOMAIN=None,  # host-only cookie
+            SESSION_COOKIE_PATH="/",     # use "/" for Render root
         )
 
 # ===================== Logging =====================
@@ -142,7 +145,10 @@ logging.getLogger("pymongo").setLevel(logging.ERROR)
 
 # ===================== Mongo =====================
 mongo = PyMongo(app)
-mongo.db.users.create_index("username", unique=True)
+try:
+    mongo.db.users.create_index("username", unique=True)
+except Exception:
+    pass
 
 try:
     mongo.cx.server_info()
@@ -303,20 +309,21 @@ def get_current_user_alias():
 def logout_user():
     session.clear()
     resp = jsonify({"message": "Logged out"})
-    # delete cookie with correct scope depending on env
+    # Delete cookie; mirror current cookie attributes so browsers remove it
+    origin = request.headers.get("Origin")
     host = (request.host or "").split(":")[0]
-    if host.endswith(PROD_DOMAIN):
-        resp.delete_cookie(
-            key="session",
-            path=API_PREFIX,
-            domain=PROD_DOMAIN,
-            samesite="None",
-            secure=True,
-        )
-    elif host.endswith(".onrender.com"):
-        resp.delete_cookie("session", path="/", samesite="None", secure=True)
-    else:
+    same_site = False
+    if origin:
+        try:
+            ohost = urlparse(origin).hostname or ""
+            same_site = (ohost == host) or ohost.endswith("." + host)
+        except Exception:
+            same_site = False
+
+    if same_site:
         resp.delete_cookie("session", path="/")
+    else:
+        resp.delete_cookie("session", path="/", samesite="None", secure=True)
     return resp, 200
 
 @app.route("/update_username", methods=["POST"])
@@ -571,7 +578,7 @@ def get_chats():
 def get_user_emotions():
     user_id = session.get("user_id")
     if not user_id:
-        return jsonify([]), 200
+        return jsonify({"message": "Not logged in"}), 401
     user = mongo.db.users.find_one({"_id": ObjectId(user_id)}, {"_id": 0, "emotions": 1})
     emotions = user.get("emotions", []) if user else []
     emotions.sort(key=lambda e: e.get("timestamp", ""), reverse=True)
@@ -581,13 +588,13 @@ def get_user_emotions():
 def stress_dashboard():
     user_id = session.get("user_id")
     if not user_id:
-        return jsonify([]), 200
+        return jsonify({"message": "Not logged in"}), 401
     user = mongo.db.users.find_one({"_id": ObjectId(user_id)}, {"_id": 0, "emotions": 1})
     data = user.get("emotions", []) if user else []
     data.sort(key=lambda e: e.get("timestamp", ""), reverse=True)
     return jsonify(data), 200
 
-# ===================== Interventions (NEW) =====================
+# ===================== Interventions =====================
 ALLOWED_INTERVENTIONS = {"breathing", "break", "dietVoice", "chatbot"}
 
 def _parse_iso(ts):
@@ -747,7 +754,7 @@ def intervention_finish():
     )
     return jsonify({"ok": True, "end_time": now.isoformat(), "duration_ms": duration_ms}), 200
 
-# ---- Debug helper (optional; remove if you prefer) ----
+# ---- Debug helper ----
 @app.route("/debug/cookies")
 def debug_cookies():
     return jsonify({

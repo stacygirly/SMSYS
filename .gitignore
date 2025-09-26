@@ -1,0 +1,15 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Virtual environment
+venv/
+
+# Local Flask session data
+flask_session/
+
+# Environment variables
+.env
+
+# Large data
+Cleaned_Data_Set/

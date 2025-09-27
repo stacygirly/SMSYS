@@ -1,12 +1,11 @@
 # backend.py
 import os
 
-# ===== Force CPU (avoid cuDNN/CUDA mismatch for LSTM inference) =====
-# Must be set BEFORE importing any tensorflow/keras submodules.
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")   # reduce TF log noise
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")  # hide all GPUs from TF
+# ===== Force CPU; reduce TF log noise (must be BEFORE importing TF/Keras) =====
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
 
-# Load .env in local dev (no effect on Render; Render injects env vars)
+# Load .env locally (Render injects env vars)
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -18,6 +17,7 @@ import tempfile
 import shutil
 import subprocess
 from datetime import datetime, timezone
+from threading import Lock
 
 import numpy as np
 import joblib
@@ -33,52 +33,53 @@ from flask_session import Session
 from bson.objectid import ObjectId
 from bson.binary import Binary
 
-# Import TF AFTER env flags above; also explicitly hide GPUs.
+# Import TF AFTER the env flags
 import tensorflow as tf
 try:
     tf.config.set_visible_devices([], "GPU")  # extra safety
 except Exception:
     pass
-
 from tensorflow.keras.optimizers import Nadam
-from openai import OpenAI
+
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None  # optional
 
 # ===================== Deployment constants (env-overridable) =====================
 PROD_DOMAIN = os.getenv("PROD_DOMAIN", "persuasive.research.cs.dal.ca")
 API_PREFIX  = os.getenv("API_PREFIX", "/smsys")
 ALLOWED_ORIGINS = {
-    # local dev
     "http://localhost:3000",
     "http://127.0.0.1:3000",
     "http://localhost:5173",
-    # prod web
-    "https://persuasive.research.cs.dal.ca",
+    "http://127.0.0.1:5173",
     "https://stacygirly.github.io",
-    # backend host itself (harmless to include)
-    "https://smsys.onrender.com",
+    "https://persuasive.research.cs.dal.ca",
+    "https://smsys.onrender.com",  # Render backend host
 }
 
-# ===================== App & Config =====================
+# ===================== Flask app & base config =====================
 app = Flask(__name__)
-app.url_map.strict_slashes = False  # accept /@me and /@me/
 app.config["SECRET_KEY"] = os.getenv("FLASK_SECRET_KEY", "dev-only-fallback")
-app.config["MONGO_URI"] = os.getenv("MONGO_URI")
+app.config["MONGO_URI"]  = os.getenv("MONGO_URI")
 
-# Base session config; details adjusted per-request in @before_request
+# File-system session (simple/reliable on Render free tier)
 app.config.update(
     SESSION_TYPE="filesystem",
     SESSION_PERMANENT=False,
     SESSION_USE_SIGNER=True,
     SESSION_COOKIE_NAME="session",
     SESSION_COOKIE_HTTPONLY=True,
-    SESSION_COOKIE_SAMESITE="Lax",  # local default; adjusted dynamically below
-    SESSION_COOKIE_SECURE=False,    # local default; adjusted dynamically below
-    SESSION_COOKIE_PATH="/",        # local default; adjusted dynamically below
-    SESSION_COOKIE_DOMAIN=None,     # local default; adjusted dynamically below
+    # Defaults for local; adjusted dynamically in @before_request
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=False,
+    SESSION_COOKIE_PATH="/",
+    SESSION_COOKIE_DOMAIN=None,
 )
 Session(app)
 
-# CORS – allow credentials and echo exact origin later in after_request
+# CORS (allow credentials; we echo the exact origin in after_request)
 CORS(
     app,
     supports_credentials=True,
@@ -88,7 +89,7 @@ CORS(
     expose_headers=["Content-Type", "Authorization"],
 )
 
-# Echo precise origin + credentials
+# Echo precise origin + credentials on every response
 @app.after_request
 def add_cors_headers(resp):
     origin = request.headers.get("Origin")
@@ -100,24 +101,15 @@ def add_cors_headers(resp):
         resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,DELETE,OPTIONS"
     return resp
 
-# Accept ALL preflights with a clean 204 (prevents odd 30x behavior)
-@app.route("/", methods=["OPTIONS"])
-def cors_root():
-    return ("", 204)
-
-@app.route("/<path:_unused>", methods=["OPTIONS"])
-def cors_preflight(_unused):
-    return ("", 204)
-
-# Dynamically scope cookie for prod and Render (cross-site cookie for SPA → API)
+# Make the session cookie cross-site where needed
 @app.before_request
 def _scope_session_cookie():
     host = (request.host or "").split(":")[0]
-    is_prod   = host.endswith(PROD_DOMAIN)
-    is_render = host.endswith(".onrender.com")  # e.g., smsys.onrender.com
+    is_prod   = host.endswith(PROD_DOMAIN)                     # e.g. persuasive.research.cs.dal.ca
+    is_render = host.endswith(".onrender.com")                 # e.g. smsys.onrender.com
 
     if is_prod:
-        # prod behind /smsys
+        # API is under /smsys on same apex domain as SPA → cross-site, scoped to /smsys
         app.config.update(
             SESSION_COOKIE_SAMESITE="None",
             SESSION_COOKIE_SECURE=True,
@@ -125,11 +117,11 @@ def _scope_session_cookie():
             SESSION_COOKIE_PATH=API_PREFIX,
         )
     elif is_render:
-        # Render: host-only cookie at root path
+        # API is the site itself; SPA comes from GitHub Pages → cross-site cookie at "/"
         app.config.update(
             SESSION_COOKIE_SAMESITE="None",
             SESSION_COOKIE_SECURE=True,
-            SESSION_COOKIE_DOMAIN=None,
+            SESSION_COOKIE_DOMAIN=None,   # host-only cookie
             SESSION_COOKIE_PATH="/",
         )
     else:
@@ -144,7 +136,7 @@ def _scope_session_cookie():
 # ===================== Logging =====================
 class CustomFormatter(logging.Formatter):
     def format(self, record):
-        return f"{record.levelname}: {record.message}"
+        return f"{record.levelname}: {record.getMessage()}"
 
 handler = logging.StreamHandler()
 handler.setFormatter(CustomFormatter())
@@ -156,7 +148,6 @@ logging.getLogger("pymongo").setLevel(logging.ERROR)
 # ===================== Mongo =====================
 mongo = PyMongo(app)
 mongo.db.users.create_index("username", unique=True)
-
 try:
     mongo.cx.server_info()
     print("✅ Connected to MongoDB successfully")
@@ -184,32 +175,11 @@ def load_user(user_id):
     user = mongo.db.users.find_one({"_id": ObjectId(user_id)})
     return User(str(user["_id"]), user["username"], user["password"]) if user else None
 
-# ===================== Model & Scaler =====================
-try:
-    model = joblib.load("./recordings/finalmodel.pkl")
-    model.optimizer = None
-    model.compile(optimizer=Nadam(), loss="binary_crossentropy", metrics=["accuracy"])
-    print("✅ Model loaded successfully for inference.")
-except Exception as e:
-    print("⚠️ Error loading model:", e)
-    model = None
-
-try:
-    scaler = joblib.load("./recordings/finalscaler.pkl")
-except Exception as e:
-    print("⚠️ Error loading scaler:", e)
-    scaler = None
-
-recognizer = sr.Recognizer()
-
-# ===================== Audio Utils =====================
+# ===================== Audio / ML =====================
 FFMPEG = shutil.which("ffmpeg") or "ffmpeg"
 
 def _ffmpeg_to_wav(src_path, dst_path):
-    cmd = [
-        FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
-        "-i", src_path, "-ac", "1", "-ar", "16000", dst_path
-    ]
+    cmd = [FFMPEG, "-y", "-hide_banner", "-loglevel", "error", "-i", src_path, "-ac", "1", "-ar", "16000", dst_path]
     proc = subprocess.run(cmd, capture_output=True)
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr.decode("utf-8", errors="ignore") or "ffmpeg failed")
@@ -237,7 +207,6 @@ def extract_features(y, sr):
         app.logger.error(f"Feature extraction error: {e}")
         return None
 
-# ===================== Pacing logic =====================
 LOW_BAND = 0.12
 HIGH_BAND = 0.35
 THRESHOLD = 0.23
@@ -248,6 +217,27 @@ def pace_suggestion_from_pred(pred: float) -> str:
     if pred <= LOW_BAND:
         return "pace_up"
     return "steady"
+
+# ---- Lazy model/scaler load to avoid worker OOM/timeouts on boot ----
+_model = None
+_scaler = None
+_model_lock = Lock()
+
+def _load_model_and_scaler():
+    global _model, _scaler
+    if _model is not None and _scaler is not None:
+        return _model, _scaler
+    with _model_lock:
+        if _model is None or _scaler is None:
+            mdl = joblib.load("./recordings/finalmodel.pkl")
+            mdl.optimizer = None
+            mdl.compile(optimizer=Nadam(), loss="binary_crossentropy", metrics=["accuracy"])
+            scl = joblib.load("./recordings/finalscaler.pkl")
+            _model, _scaler = mdl, scl
+            print("✅ Model & scaler loaded for inference.")
+    return _model, _scaler
+
+recognizer = sr.Recognizer()
 
 # ===================== Routes =====================
 @app.route("/")
@@ -316,16 +306,9 @@ def get_current_user_alias():
 def logout_user():
     session.clear()
     resp = jsonify({"message": "Logged out"})
-    # delete cookie with correct scope depending on env
     host = (request.host or "").split(":")[0]
     if host.endswith(PROD_DOMAIN):
-        resp.delete_cookie(
-            key="session",
-            path=API_PREFIX,
-            domain=PROD_DOMAIN,
-            samesite="None",
-            secure=True,
-        )
+        resp.delete_cookie("session", path=API_PREFIX, domain=PROD_DOMAIN, samesite="None", secure=True)
     elif host.endswith(".onrender.com"):
         resp.delete_cookie("session", path="/", samesite="None", secure=True)
     else:
@@ -340,10 +323,7 @@ def update_username():
     user_id = session.get("user_id")
     if not new_username:
         return jsonify({"message": "New username is required"}), 400
-    mongo.db.users.update_one(
-        {"_id": ObjectId(user_id)},
-        {"$set": {"username": new_username}}
-    )
+    mongo.db.users.update_one({"_id": ObjectId(user_id)}, {"$set": {"username": new_username}})
     session["username"] = new_username
     return jsonify({"message": "Username updated successfully", "new_username": new_username}), 200
 
@@ -361,11 +341,7 @@ def settings_logging():
     interval = data.get("intervalSeconds")
     if not isinstance(interval, (int, float)) or interval <= 0:
         return jsonify({"message": "intervalSeconds must be a positive number"}), 400
-
-    mongo.db.users.update_one(
-        {"_id": ObjectId(user_id)},
-        {"$set": {"settings.logging_interval_sec": int(interval)}}
-    )
+    mongo.db.users.update_one({"_id": ObjectId(user_id)}, {"$set": {"settings.logging_interval_sec": int(interval)}})
     return jsonify({"message": "Interval updated", "logging_interval_sec": int(interval)}), 200
 
 @app.route("/log_status", methods=["POST"])
@@ -400,22 +376,18 @@ def log_status():
         "source": "interval",
         "timestamp": datetime.now(timezone.utc)
     }
-
-    mongo.db.users.update_one(
-        {"_id": ObjectId(user_id)},
-        {"$push": {"emotions": entry}}
-    )
+    mongo.db.users.update_one({"_id": ObjectId(user_id)}, {"$push": {"emotions": entry}})
     return jsonify(entry), 200
 
-# ---- Prediction ----
+# ---- Prediction (WebM/OGG/WAV → WAV → features → LSTM) ----
 @app.route("/predict_emotion", methods=["POST"])
 def predict_emotion():
-    """
-    Accepts an audio file (webm/ogg/wav), converts to mono 16k WAV, runs inference,
-    logs the result for the current user, and returns JSON.
-    """
-    if model is None or scaler is None:
-        return jsonify({"error": "Model or scaler not loaded"}), 500
+    try:
+        model, scaler = _load_model_and_scaler()
+    except Exception as e:
+        app.logger.exception("Model load failed")
+        return jsonify({"error": "model_load_failed", "detail": str(e)}), 500
+
     if "file" not in request.files:
         return jsonify({"error": "no file"}), 400
 
@@ -426,26 +398,22 @@ def predict_emotion():
     name_lower = (uploaded.filename or "").lower()
     mt = (uploaded.mimetype or "").lower()
     suffix = ".webm"
-    if name_lower.endswith(".ogg") or "ogg" in mt:
-        suffix = ".ogg"
-    if name_lower.endswith(".wav") or "wav" in mt or "wave" in mt:
-        suffix = ".wav"
+    if name_lower.endswith(".ogg") or "ogg" in mt: suffix = ".ogg"
+    if name_lower.endswith(".wav") or "wav" in mt or "wave" in mt: suffix = ".wav"
 
-    upload_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-    wav_tmp    = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-    upload_tmp.close()
-    wav_tmp.close()
+    up_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix); up_tmp.close()
+    wav_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav"); wav_tmp.close()
 
     try:
-        uploaded.save(upload_tmp.name)
-        if os.path.getsize(upload_tmp.name) < 1500:
+        uploaded.save(up_tmp.name)
+        if os.path.getsize(up_tmp.name) < 1500:
             raise RuntimeError("Uploaded file too small (likely truncated).")
 
         try:
-            _ffmpeg_to_wav(upload_tmp.name, wav_tmp.name)
+            _ffmpeg_to_wav(up_tmp.name, wav_tmp.name)
         except Exception as fferr:
             if suffix == ".wav":
-                shutil.copyfile(upload_tmp.name, wav_tmp.name)
+                shutil.copyfile(up_tmp.name, wav_tmp.name)
             else:
                 raise RuntimeError(str(fferr))
 
@@ -462,23 +430,21 @@ def predict_emotion():
         for i in range(num_frames):
             start = i * chunk_size
             end = (i + 1) * chunk_size if i < num_frames - 1 else len(y)
-            y_chunk = y[start:end]
-            feats = extract_features(y_chunk, sr)
+            feats = extract_features(y[start:end], sr)
             if feats is None or feats.size != 38:
                 return jsonify({"error": "Feature extraction failed"}), 500
             last_features = feats
             norm = scaler.transform([feats])
-
             x = np.expand_dims(norm, axis=2)  # (1, 38, 1)
             yhat = model.predict(x, verbose=0)
-            pred = float(yhat[0][0])
-            frame_preds.append(pred)
+            frame_preds.append(float(yhat[0][0]))
 
-        mean_prediction = float(np.mean(frame_preds))
-        label = "stressed" if mean_prediction >= THRESHOLD else "not stressed"
-        confidence = float(max(0.0, min(1.0, abs(mean_prediction - THRESHOLD) / max(THRESHOLD, 1 - THRESHOLD))))
-        pace = pace_suggestion_from_pred(mean_prediction)
+        mean_pred = float(np.mean(frame_preds))
+        label = "stressed" if mean_pred >= THRESHOLD else "not stressed"
+        confidence = float(max(0.0, min(1.0, abs(mean_pred - THRESHOLD) / max(THRESHOLD, 1 - THRESHOLD))))
+        pace = pace_suggestion_from_pred(mean_pred)
 
+        # map features (last window)
         feature_names = (
             ["zero_crossings", "spectral_centroid", "spectral_bandwidth", "spectral_rolloff"] +
             [f"mfcc_{i+1}" for i in range(13)] +
@@ -491,33 +457,31 @@ def predict_emotion():
         if last_features is not None and last_features.size == 38:
             features_map = {k: float(v) for k, v in zip(feature_names, last_features)}
 
+        # Optional logging to user history if logged in
         user_id = session.get("user_id")
         ts = datetime.now(timezone.utc)
         reason = "Prediction threshold check"
-
         if user_id:
             try:
                 mongo.db.users.update_one(
                     {"_id": ObjectId(user_id)},
-                    {"$push": {
-                        "emotions": {
-                            "emotion": label,
-                            "reason": reason,
-                            "features": features_map,
-                            "model_prediction": mean_prediction,
-                            "confidence": confidence,
-                            "pace": pace,
-                            "source": "prediction",
-                            "timestamp": ts
-                        }
-                    }}
+                    {"$push": {"emotions": {
+                        "emotion": label,
+                        "reason": reason,
+                        "features": features_map,
+                        "model_prediction": mean_pred,
+                        "confidence": confidence,
+                        "pace": pace,
+                        "source": "prediction",
+                        "timestamp": ts
+                    }}}
                 )
             except Exception as db_err:
                 app.logger.error(f"DB log error: {db_err}")
 
         return jsonify({
             "emotion": label,
-            "model_prediction": mean_prediction,
+            "model_prediction": mean_pred,
             "confidence": confidence,
             "pace_suggestion": pace,
             "reason": reason,
@@ -531,26 +495,28 @@ def predict_emotion():
         app.logger.exception("predict_emotion crashed")
         return jsonify({"error": "server_error", "detail": str(e)}), 500
     finally:
-        for p in (upload_tmp.name, wav_tmp.name):
+        for p in (up_tmp.name, wav_tmp.name):
             try:
                 if p and os.path.exists(p):
                     os.remove(p)
             except Exception:
                 pass
 
-# ---- Chat (requires login) ----
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# ---- Chat (optional; requires OPENAI_API_KEY) ----
+_openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY")) if OpenAI and os.getenv("OPENAI_API_KEY") else None
 
 @app.route("/chat", methods=["POST"])
 @login_required
 def chat_with_gpt():
+    if not _openai_client:
+        return jsonify({"error": "Chat service unavailable"}), 502
     data = request.json or {}
     user_message = (data.get("message") or "").strip()
     user_id = session.get("user_id")
     if not user_message:
         return jsonify({"error": "Message is required"}), 400
     try:
-        resp = client.chat.completions.create(
+        resp = _openai_client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": "You are a helpful assistant focused on stress/wellbeing."},
@@ -568,7 +534,7 @@ def chat_with_gpt():
         })
         return jsonify({"message": message_content}), 200
     except Exception as e:
-        app.logger.error(f"Error communicating with OpenAI API: {e}")
+        app.logger.error(f"OpenAI error: {e}")
         return jsonify({"error": "Chat service unavailable"}), 502
 
 @app.route("/chats", methods=["GET"])
@@ -600,16 +566,14 @@ def stress_dashboard():
     data.sort(key=lambda e: e.get("timestamp", ""), reverse=True)
     return jsonify(data), 200
 
-# ===================== Interventions (NEW) =====================
+# ===================== Interventions =====================
 ALLOWED_INTERVENTIONS = {"breathing", "break", "dietVoice", "chatbot"}
 
 def _parse_iso(ts):
     if not ts:
         return None
     try:
-        if isinstance(ts, str) and ts.endswith("Z"):
-            return datetime.fromisoformat(ts.replace("Z", "+00:00"))
-        return datetime.fromisoformat(ts) if isinstance(ts, str) else ts
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")) if isinstance(ts, str) else ts
     except Exception:
         return None
 
@@ -679,11 +643,7 @@ def intervention_start():
         "source": "ui",
     }
 
-    mongo.db.users.update_one(
-        {"_id": ObjectId(user_id)},
-        {"$push": {"interventions": doc}}
-    )
-
+    mongo.db.users.update_one({"_id": ObjectId(user_id)}, {"$push": {"interventions": doc}})
     return jsonify({"iid": str(iid), "start_time": start.isoformat()}), 201
 
 @app.route("/interventions/action", methods=["POST"])
@@ -701,12 +661,7 @@ def intervention_action():
     except Exception:
         return jsonify({"message": "Invalid iid"}), 400
 
-    evt = {
-        "at": datetime.now(timezone.utc),
-        "action": action,
-        "meta": data.get("meta") or {}
-    }
-
+    evt = {"at": datetime.now(timezone.utc), "action": action, "meta": data.get("meta") or {}}
     result = mongo.db.users.update_one(
         {"_id": ObjectId(user_id), "interventions.iid": aid},
         {"$push": {"interventions.$.actions": evt}}
@@ -733,11 +688,7 @@ def intervention_finish():
         return jsonify({"message": "Invalid iid"}), 400
 
     now = datetime.now(timezone.utc)
-
-    doc = mongo.db.users.find_one(
-        {"_id": ObjectId(user_id), "interventions.iid": aid},
-        {"interventions.$": 1}
-    )
+    doc = mongo.db.users.find_one({"_id": ObjectId(user_id), "interventions.iid": aid}, {"interventions.$": 1})
     if not doc or "interventions" not in doc or not doc["interventions"]:
         return jsonify({"message": "Intervention not found"}), 404
 
@@ -760,7 +711,7 @@ def intervention_finish():
     )
     return jsonify({"ok": True, "end_time": now.isoformat(), "duration_ms": duration_ms}), 200
 
-# ---- Debug helper (optional) ----
+# ---- Debug helper ----
 @app.route("/debug/cookies")
 def debug_cookies():
     return jsonify({

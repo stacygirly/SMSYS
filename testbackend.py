@@ -1,11 +1,16 @@
 # backend.py
 import os
 
-# ===== Force CPU; reduce TF log noise (must be BEFORE importing TF/Keras) =====
+# ===== Hard caps BEFORE heavy imports =====
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
-# Load .env locally (Render injects env vars)
+# Load .env in local dev (Render injects env vars)
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -25,7 +30,7 @@ import librosa
 import bcrypt
 import speech_recognition as sr
 
-from flask import Flask, request, jsonify, session
+from flask import Flask, request, jsonify, session, make_response
 from flask_cors import CORS
 from flask_pymongo import PyMongo
 from flask_login import LoginManager, UserMixin, login_user, login_required
@@ -33,12 +38,18 @@ from flask_session import Session
 from bson.objectid import ObjectId
 from bson.binary import Binary
 
-# Import TF AFTER the env flags
+# ---- TensorFlow AFTER env caps ----
 import tensorflow as tf
 try:
-    tf.config.set_visible_devices([], "GPU")  # extra safety
+    tf.config.set_visible_devices([], "GPU")
 except Exception:
     pass
+try:
+    tf.config.threading.set_intra_op_parallelism_threads(1)
+    tf.config.threading.set_inter_op_parallelism_threads(1)
+except Exception:
+    pass
+
 from tensorflow.keras.optimizers import Nadam
 
 try:
@@ -46,32 +57,37 @@ try:
 except Exception:
     OpenAI = None  # optional
 
-# ===================== Deployment constants (env-overridable) =====================
+# ===================== Deployment constants =====================
 PROD_DOMAIN = os.getenv("PROD_DOMAIN", "persuasive.research.cs.dal.ca")
 API_PREFIX  = os.getenv("API_PREFIX", "/smsys")
 ALLOWED_ORIGINS = {
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
+    # Local dev
+    "http://localhost:3000", "http://127.0.0.1:3000",
+    "http://localhost:5173", "http://127.0.0.1:5173",
+    # GitHub Pages (your SPA)
     "https://stacygirly.github.io",
+    # Prod apex (if you front with reverse proxy under /smsys)
     "https://persuasive.research.cs.dal.ca",
-    "https://smsys.onrender.com",  # Render backend host
+    # Render backend host
+    "https://smsys.onrender.com",
 }
 
-# ===================== Flask app & base config =====================
+# ===================== Flask app & session =====================
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.getenv("FLASK_SECRET_KEY", "dev-only-fallback")
 app.config["MONGO_URI"]  = os.getenv("MONGO_URI")
 
-# File-system session (simple/reliable on Render free tier)
+# Limit request body (~20 MB)
+app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024
+
+# File-system sessions (simple & reliable on Render free tier)
 app.config.update(
     SESSION_TYPE="filesystem",
     SESSION_PERMANENT=False,
     SESSION_USE_SIGNER=True,
     SESSION_COOKIE_NAME="session",
     SESSION_COOKIE_HTTPONLY=True,
-    # Defaults for local; adjusted dynamically in @before_request
+    # defaults for local; updated dynamically in @before_request
     SESSION_COOKIE_SAMESITE="Lax",
     SESSION_COOKIE_SECURE=False,
     SESSION_COOKIE_PATH="/",
@@ -79,7 +95,7 @@ app.config.update(
 )
 Session(app)
 
-# CORS (allow credentials; we echo the exact origin in after_request)
+# CORS: allow credentials, validate known origins
 CORS(
     app,
     supports_credentials=True,
@@ -89,9 +105,9 @@ CORS(
     expose_headers=["Content-Type", "Authorization"],
 )
 
-# Echo precise origin + credentials on every response
 @app.after_request
 def add_cors_headers(resp):
+    """Echo the exact Origin so browsers will accept cookies."""
     origin = request.headers.get("Origin")
     if origin in ALLOWED_ORIGINS:
         resp.headers["Access-Control-Allow-Origin"] = origin
@@ -101,15 +117,17 @@ def add_cors_headers(resp):
         resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,DELETE,OPTIONS"
     return resp
 
-# Make the session cookie cross-site where needed
 @app.before_request
-def _scope_session_cookie():
+def scope_session_cookie():
+    """
+    Ensure the session cookie has the correct samesite/secure/path/domain
+    for each environment (local, Render, prod under /smsys).
+    """
     host = (request.host or "").split(":")[0]
-    is_prod   = host.endswith(PROD_DOMAIN)                     # e.g. persuasive.research.cs.dal.ca
-    is_render = host.endswith(".onrender.com")                 # e.g. smsys.onrender.com
+    is_prod   = host.endswith(PROD_DOMAIN)
+    is_render = host.endswith(".onrender.com")  # e.g. smsys.onrender.com
 
     if is_prod:
-        # API is under /smsys on same apex domain as SPA → cross-site, scoped to /smsys
         app.config.update(
             SESSION_COOKIE_SAMESITE="None",
             SESSION_COOKIE_SECURE=True,
@@ -117,21 +135,24 @@ def _scope_session_cookie():
             SESSION_COOKIE_PATH=API_PREFIX,
         )
     elif is_render:
-        # API is the site itself; SPA comes from GitHub Pages → cross-site cookie at "/"
         app.config.update(
             SESSION_COOKIE_SAMESITE="None",
             SESSION_COOKIE_SECURE=True,
-            SESSION_COOKIE_DOMAIN=None,   # host-only cookie
+            SESSION_COOKIE_DOMAIN=None,  # host-only
             SESSION_COOKIE_PATH="/",
         )
     else:
-        # Local dev
         app.config.update(
             SESSION_COOKIE_SAMESITE="Lax",
             SESSION_COOKIE_SECURE=False,
             SESSION_COOKIE_DOMAIN=None,
             SESSION_COOKIE_PATH="/",
         )
+
+# Explicit preflight for proxies that are picky
+@app.route("/<path:_any>", methods=["OPTIONS"])
+def _options(_any):
+    return make_response(("", 204))
 
 # ===================== Logging =====================
 class CustomFormatter(logging.Formatter):
@@ -159,7 +180,6 @@ login_manager = LoginManager()
 login_manager.init_app(app)
 login_manager.login_view = "login"
 
-# Return JSON 401 (no redirects)
 @login_manager.unauthorized_handler
 def unauthorized():
     return jsonify({"message": "Not logged in"}), 401
@@ -178,49 +198,44 @@ def load_user(user_id):
 # ===================== Audio / ML =====================
 FFMPEG = shutil.which("ffmpeg") or "ffmpeg"
 
-def _ffmpeg_to_wav(src_path, dst_path):
-    cmd = [FFMPEG, "-y", "-hide_banner", "-loglevel", "error", "-i", src_path, "-ac", "1", "-ar", "16000", dst_path]
+def _ffmpeg_to_wav(src_path, dst_path, max_seconds=75):
+    """Convert to mono 16k WAV and hard-cap length to avoid timeouts."""
+    cmd = [
+        FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
+        "-i", src_path, "-t", str(max_seconds),
+        "-ac", "1", "-ar", "16000", dst_path
+    ]
     proc = subprocess.run(cmd, capture_output=True)
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr.decode("utf-8", errors="ignore") or "ffmpeg failed")
 
 def extract_features(y, sr):
     try:
-        zero_crossings = np.mean(librosa.feature.zero_crossing_rate(y=y))
-        spectral_centroid = np.mean(librosa.feature.spectral_centroid(y=y, sr=sr))
-        spectral_bandwidth = np.mean(librosa.feature.spectral_bandwidth(y=y, sr=sr))
-        spectral_rolloff = np.mean(librosa.feature.spectral_rolloff(y=y, sr=sr))
-        mfccs_mean = np.mean(librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13).T, axis=0)
-        chroma_mean = np.mean(librosa.feature.chroma_stft(y=y, sr=sr).T, axis=0)
+        zcr  = np.mean(librosa.feature.zero_crossing_rate(y=y))
+        sc   = np.mean(librosa.feature.spectral_centroid(y=y, sr=sr))
+        sb   = np.mean(librosa.feature.spectral_bandwidth(y=y, sr=sr))
+        sro  = np.mean(librosa.feature.spectral_rolloff(y=y, sr=sr))
+        mfcc = np.mean(librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13).T, axis=0)
+        chroma = np.mean(librosa.feature.chroma_stft(y=y, sr=sr).T, axis=0)
         intensity = np.mean(np.abs(y))
         speech_rate = np.array([len(librosa.effects.split(y, top_db=20)) / (len(y) / sr)])
-        spectral_contrast_mean = np.mean(librosa.feature.spectral_contrast(y=y, sr=sr).T, axis=0)
-
-        features = np.hstack([
-            zero_crossings, spectral_centroid, spectral_bandwidth, spectral_rolloff,
-            mfccs_mean, chroma_mean, intensity, spectral_contrast_mean, speech_rate
-        ])
-        if features.size != 38:
-            raise ValueError(f"Expected 38 features, got {features.size}")
-        return features
+        scontrast = np.mean(librosa.feature.spectral_contrast(y=y, sr=sr).T, axis=0)
+        feats = np.hstack([zcr, sc, sb, sro, mfcc, chroma, intensity, scontrast, speech_rate])
+        if feats.size != 38:
+            raise ValueError(f"Expected 38 features, got {feats.size}")
+        return feats
     except Exception as e:
         app.logger.error(f"Feature extraction error: {e}")
         return None
 
-LOW_BAND = 0.12
-HIGH_BAND = 0.35
-THRESHOLD = 0.23
-
-def pace_suggestion_from_pred(pred: float) -> str:
-    if pred >= HIGH_BAND:
-        return "pace_down"
-    if pred <= LOW_BAND:
-        return "pace_up"
+LOW_BAND, HIGH_BAND, THRESHOLD = 0.12, 0.35, 0.23
+def pace_suggestion_from_pred(p):
+    if p >= HIGH_BAND: return "pace_down"
+    if p <= LOW_BAND:  return "pace_up"
     return "steady"
 
-# ---- Lazy model/scaler load to avoid worker OOM/timeouts on boot ----
-_model = None
-_scaler = None
+# Lazy load model/scaler to avoid boot OOM/timeouts
+_model, _scaler = None, None
 _model_lock = Lock()
 
 def _load_model_and_scaler():
@@ -244,6 +259,18 @@ recognizer = sr.Recognizer()
 def home():
     return jsonify({"message": "Backend is running successfully!"})
 
+@app.route("/healthz")
+def healthz():
+    return jsonify({"ok": True})
+
+@app.route("/wake")
+def wake():
+    try:
+        _load_model_and_scaler()
+        return jsonify({"ok": True, "model": "ready"})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
 # ---- Auth ----
 @app.route("/register", methods=["POST"])
 def register():
@@ -257,9 +284,9 @@ def register():
         return jsonify({"message": "Passwords do not match"}), 400
     if mongo.db.users.find_one({"username": username}):
         return jsonify({"message": "Username already exists"}), 400
-    hashed_password = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt())
-    user_id = mongo.db.users.insert_one({"username": username, "password": hashed_password}).inserted_id
-    return jsonify({"message": "User registered", "user_id": str(user_id)}), 201
+    hashed = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt())
+    uid = mongo.db.users.insert_one({"username": username, "password": hashed}).inserted_id
+    return jsonify({"message": "User registered", "user_id": str(uid)}), 201
 
 @app.route("/login", methods=["POST"])
 def login():
@@ -272,14 +299,10 @@ def login():
         return jsonify({"message": "Invalid credentials"}), 401
 
     stored = user.get("password")
-    if isinstance(stored, Binary):
-        stored_bytes = bytes(stored)
-    elif isinstance(stored, (bytes, bytearray)):
-        stored_bytes = stored
-    elif isinstance(stored, str):
-        stored_bytes = stored.encode("utf-8")
-    else:
-        return jsonify({"message": "Invalid credentials"}), 401
+    if isinstance(stored, Binary):      stored_bytes = bytes(stored)
+    elif isinstance(stored, (bytes, bytearray)): stored_bytes = stored
+    elif isinstance(stored, str):       stored_bytes = stored.encode("utf-8")
+    else:                               return jsonify({"message": "Invalid credentials"}), 401
 
     if bcrypt.checkpw(raw_pw, stored_bytes):
         user_obj = User(str(user["_id"]), user["username"], stored_bytes)
@@ -298,7 +321,7 @@ def get_current_user_route():
     user = mongo.db.users.find_one({"_id": ObjectId(user_id)})
     return jsonify({"id": str(user["_id"]), "username": user["username"], "message": "Session active"})
 
-@app.route("/me")  # alias
+@app.route("/me")
 def get_current_user_alias():
     return get_current_user_route()
 
@@ -320,9 +343,9 @@ def logout_user():
 def update_username():
     data = request.json or {}
     new_username = data.get("new_username")
-    user_id = session.get("user_id")
     if not new_username:
         return jsonify({"message": "New username is required"}), 400
+    user_id = session.get("user_id")
     mongo.db.users.update_one({"_id": ObjectId(user_id)}, {"$set": {"username": new_username}})
     session["username"] = new_username
     return jsonify({"message": "Username updated successfully", "new_username": new_username}), 200
@@ -341,7 +364,9 @@ def settings_logging():
     interval = data.get("intervalSeconds")
     if not isinstance(interval, (int, float)) or interval <= 0:
         return jsonify({"message": "intervalSeconds must be a positive number"}), 400
-    mongo.db.users.update_one({"_id": ObjectId(user_id)}, {"$set": {"settings.logging_interval_sec": int(interval)}})
+
+    mongo.db.users.update_one({"_id": ObjectId(user_id)},
+                              {"$set": {"settings.logging_interval_sec": int(interval)}})
     return jsonify({"message": "Interval updated", "logging_interval_sec": int(interval)}), 200
 
 @app.route("/log_status", methods=["POST"])
@@ -355,7 +380,9 @@ def log_status():
 
     model_pred = data.get("model_prediction")
     try:
-        model_pred = float(model_pred) if model_pred is not None else (THRESHOLD - 0.05 if status == "not stressed" else THRESHOLD + 0.12)
+        model_pred = float(model_pred) if model_pred is not None else (
+            THRESHOLD - 0.05 if status == "not stressed" else THRESHOLD + 0.12
+        )
     except Exception:
         model_pred = THRESHOLD - 0.05 if status == "not stressed" else THRESHOLD + 0.12
 
@@ -379,7 +406,7 @@ def log_status():
     mongo.db.users.update_one({"_id": ObjectId(user_id)}, {"$push": {"emotions": entry}})
     return jsonify(entry), 200
 
-# ---- Prediction (WebM/OGG/WAV → WAV → features → LSTM) ----
+# ---- Prediction (webm/ogg/wav → wav → features → LSTM) ----
 @app.route("/predict_emotion", methods=["POST"])
 def predict_emotion():
     try:
@@ -410,7 +437,7 @@ def predict_emotion():
             raise RuntimeError("Uploaded file too small (likely truncated).")
 
         try:
-            _ffmpeg_to_wav(up_tmp.name, wav_tmp.name)
+            _ffmpeg_to_wav(up_tmp.name, wav_tmp.name, max_seconds=75)
         except Exception as fferr:
             if suffix == ".wav":
                 shutil.copyfile(up_tmp.name, wav_tmp.name)
@@ -421,7 +448,14 @@ def predict_emotion():
         if y is None or y.size == 0:
             raise RuntimeError("Decoded audio is empty.")
 
+        # Guard rails in memory too
+        max_duration = 75.0
         duration = librosa.get_duration(y=y, sr=sr)
+        if duration > max_duration + 1:
+            y = y[: int(sr * max_duration)]
+            duration = max_duration
+
+        # Lightweight chunking
         num_frames = 4 if duration <= 60 else max(1, int(duration // 15))
         chunk_size = max(1, len(y) // num_frames)
 
@@ -444,7 +478,7 @@ def predict_emotion():
         confidence = float(max(0.0, min(1.0, abs(mean_pred - THRESHOLD) / max(THRESHOLD, 1 - THRESHOLD))))
         pace = pace_suggestion_from_pred(mean_pred)
 
-        # map features (last window)
+        # map features (last window only)
         feature_names = (
             ["zero_crossings", "spectral_centroid", "spectral_bandwidth", "spectral_rolloff"] +
             [f"mfcc_{i+1}" for i in range(13)] +
@@ -523,16 +557,14 @@ def chat_with_gpt():
                 {"role": "user", "content": user_message},
             ],
         )
-        message_content = resp.choices[0].message.content
+        content = resp.choices[0].message.content
         mongo.db.chats.insert_one({
             "user_id": ObjectId(user_id),
-            "messages": [
-                {"role": "user", "content": user_message},
-                {"role": "assistant", "content": message_content},
-            ],
+            "messages": [{"role": "user", "content": user_message},
+                         {"role": "assistant", "content": content}],
             "timestamp": datetime.now(timezone.utc),
         })
-        return jsonify({"message": message_content}), 200
+        return jsonify({"message": content}), 200
     except Exception as e:
         app.logger.error(f"OpenAI error: {e}")
         return jsonify({"error": "Chat service unavailable"}), 502
@@ -542,7 +574,7 @@ def chat_with_gpt():
 def get_chats():
     user_id = session.get("user_id")
     chats = mongo.db.chats.find({"user_id": ObjectId(user_id)})
-    chat_list = [{"messages": chat["messages"], "timestamp": chat["timestamp"]} for chat in chats]
+    chat_list = [{"messages": c["messages"], "timestamp": c["timestamp"]} for c in chats]
     return jsonify(chat_list), 200
 
 # ---- Emotions Data ----
@@ -566,7 +598,7 @@ def stress_dashboard():
     data.sort(key=lambda e: e.get("timestamp", ""), reverse=True)
     return jsonify(data), 200
 
-# ===================== Interventions =====================
+# ---- Interventions ----
 ALLOWED_INTERVENTIONS = {"breathing", "break", "dietVoice", "chatbot"}
 
 def _parse_iso(ts):
@@ -582,16 +614,16 @@ def _jsonify_intervention(doc):
     if "iid" in out and isinstance(out["iid"], ObjectId):
         out["iid"] = str(out["iid"])
     for key in ("start_time", "end_time", "stressed_detected_at"):
-        if key in out and isinstance(out[key], datetime):
+        if isinstance(out.get(key), datetime):
             out[key] = out[key].isoformat()
     if isinstance(out.get("actions"), list):
-        norm_actions = []
+        norm = []
         for a in out["actions"]:
             aa = dict(a)
             if isinstance(aa.get("at"), datetime):
                 aa["at"] = aa["at"].isoformat()
-            norm_actions.append(aa)
-        out["actions"] = norm_actions
+            norm.append(aa)
+        out["actions"] = norm
     return out
 
 @app.route("/interventions", methods=["GET"])
@@ -625,24 +657,13 @@ def intervention_start():
 
     start = datetime.now(timezone.utc)
     iid = ObjectId()
-
     doc = {
-        "iid": iid,
-        "type": itype,
-        "status": "started",
-        "start_time": start,
-        "end_time": None,
-        "duration_ms": None,
+        "iid": iid, "type": itype, "status": "started",
+        "start_time": start, "end_time": None, "duration_ms": None,
         "emotion_at_trigger": emotion_at_trigger,
-        "model_prediction": model_prediction,
-        "confidence": confidence,
-        "pace": pace,
-        "stressed_detected_at": stressed_at,
-        "actions": [],
-        "note": note,
-        "source": "ui",
+        "model_prediction": model_prediction, "confidence": confidence, "pace": pace,
+        "stressed_detected_at": stressed_at, "actions": [], "note": note, "source": "ui",
     }
-
     mongo.db.users.update_one({"_id": ObjectId(user_id)}, {"$push": {"interventions": doc}})
     return jsonify({"iid": str(iid), "start_time": start.isoformat()}), 201
 
@@ -689,13 +710,11 @@ def intervention_finish():
 
     now = datetime.now(timezone.utc)
     doc = mongo.db.users.find_one({"_id": ObjectId(user_id), "interventions.iid": aid}, {"interventions.$": 1})
-    if not doc or "interventions" not in doc or not doc["interventions"]:
+    if not doc or not doc.get("interventions"):
         return jsonify({"message": "Intervention not found"}), 404
 
     started = doc["interventions"][0].get("start_time")
-    server_dur = None
-    if isinstance(started, datetime):
-        server_dur = int((now - started).total_seconds() * 1000)
+    server_dur = int((now - started).total_seconds() * 1000) if isinstance(started, datetime) else None
 
     duration_ms = data.get("duration_ms")
     if duration_ms is None:
@@ -721,6 +740,6 @@ def debug_cookies():
         "path": request.path,
     })
 
-# ===================== Run =====================
+# ===================== Run (dev only) =====================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)

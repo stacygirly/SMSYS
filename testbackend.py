@@ -1,3 +1,4 @@
+# testbackend.py
 import os
 
 # ===== Force CPU & quieter TF logs BEFORE importing tensorflow =====
@@ -27,7 +28,10 @@ import speech_recognition as sr
 from flask import Flask, request, jsonify, session
 from flask_cors import CORS
 from flask_pymongo import PyMongo
-from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user
+from flask_login import (
+    LoginManager, UserMixin, login_user, login_required,
+    logout_user as flask_logout_user
+)
 from flask_session import Session
 from bson.objectid import ObjectId
 from bson.binary import Binary
@@ -69,17 +73,22 @@ app = Flask(__name__)
 app.config.update(
     SECRET_KEY=os.getenv("FLASK_SECRET_KEY", "dev-only-fallback"),
     MONGO_URI=os.getenv("MONGO_URI"),
+
+    # File-system sessions (simple & reliable on Render free tier)
     SESSION_TYPE="filesystem",
     SESSION_PERMANENT=False,
     SESSION_USE_SIGNER=True,
     SESSION_COOKIE_NAME="session",
     SESSION_COOKIE_HTTPONLY=True,
+
     # defaults (adjusted dynamically in @before_request)
     SESSION_COOKIE_SAMESITE="Lax",
     SESSION_COOKIE_SECURE=False,
     SESSION_COOKIE_PATH="/",
     SESSION_COOKIE_DOMAIN=None,
-    MAX_CONTENT_LENGTH=10 * 1024 * 1024,  # 10MB uploads
+
+    # Upload size limit (10MB)
+    MAX_CONTENT_LENGTH=10 * 1024 * 1024,
 )
 Session(app)
 
@@ -90,6 +99,7 @@ CORS(
     resources={r"/*": {"origins": list(ALLOWED_ORIGINS)}},
     methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization"],
+    expose_headers=["Content-Type", "Authorization"],
 )
 
 @app.after_request
@@ -105,6 +115,12 @@ def add_cors_headers(resp):
 
 @app.before_request
 def scope_session_cookie():
+    """
+    Make the session cookie cross-site where needed:
+      - prod: API under /smsys on the same apex domain as the SPA
+      - render: backend on *.onrender.com, SPA on GitHub Pages
+      - local: http://localhost:*
+    """
     host = (request.host or "").split(":")[0]
     is_prod   = host.endswith(PROD_DOMAIN)         # api on same apex as SPA path
     is_render = host.endswith(".onrender.com")     # api on Render, SPA on GH pages
@@ -187,6 +203,18 @@ def _ffmpeg_to_wav(src_path, dst_path):
         raise RuntimeError(proc.stderr.decode("utf-8", errors="ignore") or "ffmpeg failed")
 
 def extract_features(y, sr):
+    """
+    Returns a 38-dim feature vector:
+      1 zero_crossings
+      1 spectral_centroid
+      1 spectral_bandwidth
+      1 spectral_rolloff
+      13 mfcc
+      12 chroma
+      1 intensity
+      7 spectral_contrast
+      1 speech_rate
+    """
     try:
         zero_crossings = np.mean(librosa.feature.zero_crossing_rate(y=y))
         spectral_centroid = np.mean(librosa.feature.spectral_centroid(y=y, sr=sr))
@@ -310,7 +338,7 @@ def me_alias():
 @app.route("/logout", methods=["POST"])
 def logout():
     try:
-        logout_user()
+        flask_logout_user()
     except Exception:
         pass
     session.clear()
@@ -389,7 +417,8 @@ def log_status():
 @app.route("/predict_emotion", methods=["POST", "OPTIONS"])
 def predict_emotion():
     if request.method == "OPTIONS":
-        return ("", 204)  # preflight
+        # CORS preflight is auto-handled by Flask-CORS, but returning 204 is safe.
+        return ("", 204)
 
     try:
         model, scaler = _load_model_and_scaler()
@@ -522,8 +551,10 @@ def chat():
     try:
         resp = _openai.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[{"role": "system", "content": "You are a helpful assistant focused on stress/wellbeing."},
-                      {"role": "user", "content": msg}],
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant focused on stress/wellbeing."},
+                {"role": "user", "content": msg}
+            ],
         )
         out = resp.choices[0].message.content
         mongo.db.chats.insert_one({

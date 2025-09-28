@@ -1,5 +1,6 @@
 # testbackend.py
 import os
+from scipy.io import wavfile
 
 # ===== Force CPU & quieter TF logs BEFORE importing tensorflow =====
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
@@ -417,7 +418,7 @@ def log_status():
 @app.route("/predict_emotion", methods=["POST", "OPTIONS"])
 def predict_emotion():
     if request.method == "OPTIONS":
-        # CORS preflight is auto-handled by Flask-CORS, but returning 204 is safe.
+        # Fast CORS preflight response
         return ("", 204)
 
     try:
@@ -428,10 +429,12 @@ def predict_emotion():
 
     if "file" not in request.files:
         return jsonify({"error": "no file"}), 400
+
     uploaded = request.files["file"]
     if not uploaded or uploaded.filename == "":
         return jsonify({"error": "empty filename"}), 400
 
+    # Decide if it’s WAV; if not, convert via ffmpeg
     name_lower = (uploaded.filename or "").lower()
     mt = (uploaded.mimetype or "").lower()
     is_wav = name_lower.endswith(".wav") or "wav" in mt or "wave" in mt
@@ -448,16 +451,35 @@ def predict_emotion():
         if not is_wav:
             if shutil.which(FFMPEG):
                 wav_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav"); wav_tmp.close()
-                _ffmpeg_to_wav(src_path, wav_tmp.name)
+                _ffmpeg_to_wav(up_tmp.name, wav_tmp.name)
                 src_path = wav_tmp.name
             else:
-                raise RuntimeError("Non-WAV upload but ffmpeg unavailable. Send WAV from client.")
+                # Tell the client to send WAV directly (Fix B)
+                return jsonify({"error": "decode_failed", "detail": "ffmpeg unavailable; send WAV"}), 415
 
-        y, sr = librosa.load(src_path, sr=None, mono=True)
-        if y is None or y.size == 0:
-            raise RuntimeError("Decoded audio is empty.")
+        # ---- Safer WAV decode: scipy.io.wavfile ----
+        try:
+            sr, data = wavfile.read(src_path)
+        except Exception as de:
+            return jsonify({"error": "decode_failed", "detail": f"WAV read failed: {de}"}), 415
 
-        duration = librosa.get_duration(y=y, sr=sr)
+        if data is None or data.size == 0:
+            return jsonify({"error": "decode_failed", "detail": "Empty audio"}), 415
+
+        # Convert to float32 mono in [-1, 1]
+        if data.ndim > 1:
+            data = data.mean(axis=1)
+        if np.issubdtype(data.dtype, np.integer):
+            maxv = float(np.iinfo(data.dtype).max)
+            y = (data.astype(np.float32) / maxv)
+        else:
+            y = data.astype(np.float32)
+        # Optional: downsample long audio (keeps compute small)
+        duration = len(y) / float(sr)
+        if duration > 180:  # cap to 3 minutes
+            y = y[:int(180 * sr)]
+
+        # Frame & features → prediction
         num_frames = 4 if duration <= 60 else max(1, int(duration // 15))
         chunk_size = max(1, len(y) // num_frames)
 
@@ -526,14 +548,11 @@ def predict_emotion():
         app.logger.exception("predict_emotion crashed")
         return jsonify({"error": "server_error", "detail": str(e)}), 500
     finally:
-        try:
-            if up_tmp and os.path.exists(up_tmp.name): os.remove(up_tmp.name)
-        except Exception:
-            pass
-        try:
-            if wav_tmp and os.path.exists(wav_tmp.name): os.remove(wav_tmp.name)
-        except Exception:
-            pass
+        for p in (up_tmp.name, wav_tmp.name if wav_tmp else None):
+            try:
+                if p and os.path.exists(p): os.remove(p)
+            except Exception:
+                pass
 
 
 # ---- Optional chat (only if OPENAI_API_KEY) ----

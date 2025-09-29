@@ -33,6 +33,7 @@ from flask_session import Session
 from bson.objectid import ObjectId
 from bson.binary import Binary
 import gridfs
+from urllib.parse import urlparse
 
 # Import TF after env flags
 import tensorflow as tf
@@ -266,10 +267,11 @@ def _save_latest_audio_gridfs(user_id: str, wav_bytes: bytes, *, filename="lates
         user_id=user_id,
         uploaded_at=datetime.now(timezone.utc),
     )
-    mongo.db.users.update_one(
+    up = mongo.db.users.update_one(
         {"_id": ObjectId(user_id)},
         {"$set": {"latest_audio_id": str(fid)}}
     )
+    app.logger.info(f"GridFS latest set → ack={up.acknowledged}")
     return str(fid)
 
 def _fetch_audio_from_gridfs_to_tempfile(audio_id: str | None, user_id: str | None):
@@ -301,6 +303,58 @@ def home():
 def healthz():
     return "ok", 200
 
+# ---- Debug DB endpoints ----
+@app.route("/debug/dbinfo")
+def dbinfo():
+    uri = os.getenv("MONGO_URI", "")
+    try:
+        parsed = urlparse(uri.replace("mongodb+srv", "mongodb"))
+        # database is after the last '/' in URI; with SRV it’s in the path part
+        db_name = (parsed.path or "/").lstrip("/") or "(none-set)"
+    except Exception:
+        db_name = "(parse-failed)"
+    try:
+        ping = mongo.cx.admin.command("ping")
+        status = "ok" if ping.get("ok") == 1 else "bad"
+    except Exception as e:
+        status = f"error: {e}"
+
+    try:
+        colls = mongo.db.list_collection_names()
+    except Exception as e:
+        colls = [f"(error listing colls: {e})"]
+
+    try:
+        users = mongo.db.users.count_documents({})
+        chats = mongo.db.chats.count_documents({})
+        fs_files = mongo.db.fs.files.count_documents({})
+    except Exception:
+        users = chats = fs_files = -1
+
+    return jsonify({
+        "MONGO_URI_present": bool(uri),
+        "db_name_from_uri": db_name,
+        "ping": status,
+        "collections": colls,
+        "counts": {"users": users, "chats": chats, "fs.files": fs_files},
+    }), 200
+
+@app.route("/debug/user_snapshot")
+@login_required
+def user_snapshot():
+    uid = session.get("user_id")
+    u = mongo.db.users.find_one({"_id": ObjectId(uid)})
+    if not u:
+        return jsonify({"error": "user_not_found"}), 404
+    em = u.get("emotions", [])[-5:]
+    return jsonify({
+        "user_id": uid,
+        "username": u.get("username"),
+        "has_latest_audio": bool(u.get("latest_audio_id")),
+        "latest_audio_id": u.get("latest_audio_id"),
+        "emotions_tail": em
+    }), 200
+
 # ---- Auth ----
 @app.route("/register", methods=["POST"])
 def register():
@@ -315,8 +369,17 @@ def register():
     if mongo.db.users.find_one({"username": username}):
         return jsonify({"message": "Username already exists"}), 400
     hashed = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt())
-    uid = mongo.db.users.insert_one({"username": username, "password": hashed}).inserted_id
-    return jsonify({"message": "User registered", "user_id": str(uid)}), 201
+    doc = {
+        "username": username,
+        "password": hashed,
+        "emotions": [],
+        "interventions": [],
+        "settings": {},
+        "created_at": datetime.now(timezone.utc),
+    }
+    ins = mongo.db.users.insert_one(doc)
+    app.logger.info(f"Registered uid={ins.inserted_id}")
+    return jsonify({"message": "User registered", "user_id": str(ins.inserted_id)}), 201
 
 @app.route("/login", methods=["POST"])
 def login():
@@ -360,7 +423,6 @@ def me_alias():
 
 @app.route("/logout", methods=["POST"])
 def logout_route():
-    # capture uid before clearing session
     uid = session.get("user_id")
     try:
         logout_user()
@@ -399,7 +461,8 @@ def update_username():
     uid = session.get("user_id")
     if not new_username:
         return jsonify({"message": "New username is required"}), 400
-    mongo.db.users.update_one({"_id": ObjectId(uid)}, {"$set": {"username": new_username}})
+    up = mongo.db.users.update_one({"_id": ObjectId(uid)}, {"$set": {"username": new_username}})
+    app.logger.info(f"update_username ack={up.acknowledged} matched={up.matched_count} modified={up.modified_count}")
     session["username"] = new_username
     return jsonify({"message": "Username updated successfully", "new_username": new_username}), 200
 
@@ -416,7 +479,8 @@ def settings_logging():
     interval = data.get("intervalSeconds")
     if not isinstance(interval, (int, float)) or interval <= 0:
         return jsonify({"message": "intervalSeconds must be positive"}), 400
-    mongo.db.users.update_one({"_id": ObjectId(uid)}, {"$set": {"settings.logging_interval_sec": int(interval)}})
+    up = mongo.db.users.update_one({"_id": ObjectId(uid)}, {"$set": {"settings.logging_interval_sec": int(interval)}})
+    app.logger.info(f"settings_logging ack={up.acknowledged} matched={up.matched_count} modified={up.modified_count}")
     return jsonify({"message": "Interval updated", "logging_interval_sec": int(interval)}), 200
 
 @app.route("/log_status", methods=["POST"])
@@ -447,7 +511,8 @@ def log_status():
         "source": "interval",
         "timestamp": datetime.now(timezone.utc)
     }
-    mongo.db.users.update_one({"_id": ObjectId(uid)}, {"$push": {"emotions": entry}})
+    up = mongo.db.users.update_one({"_id": ObjectId(uid)}, {"$push": {"emotions": entry}})
+    app.logger.info(f"log_status ack={up.acknowledged} matched={up.matched_count} modified={up.modified_count}")
     return jsonify(entry), 200
 
 # ---- Prediction (upload path: WebM/OGG/WAV → WAV) ----
@@ -491,7 +556,7 @@ def predict_emotion():
             else:
                 raise RuntimeError(str(fferr))
 
-        # (Optional) Save the normalized WAV as the user's rolling/latest audio
+        # Save the normalized WAV as the user's rolling/latest audio (if logged in)
         try:
             uid = session.get("user_id")
             if uid:
@@ -542,7 +607,7 @@ def predict_emotion():
         ts = datetime.now(timezone.utc)
         if uid:
             try:
-                mongo.db.users.update_one(
+                up = mongo.db.users.update_one(
                     {"_id": ObjectId(uid)},
                     {"$push": {"emotions": {
                         "emotion": label,
@@ -555,6 +620,7 @@ def predict_emotion():
                         "timestamp": ts
                     }}}
                 )
+                app.logger.info(f"predict_emotion push ack={up.acknowledged} matched={up.matched_count} modified={up.modified_count}")
             except Exception as e:
                 app.logger.error(f"DB log error: {e}")
 
@@ -649,10 +715,11 @@ def predict_from_gridfs():
         ts = datetime.now(timezone.utc)
         reason = "Prediction from GridFS"
         try:
-            mongo.db.users.update_one(
+            up = mongo.db.users.update_one(
                 {"_id": ObjectId(uid)},
                 {"$push": {"emotions": {
-                    "emotion": label,
+                    "em
+                    otion": label,
                     "reason": reason,
                     "features": features_map,
                     "model_prediction": mean_pred,
@@ -662,6 +729,7 @@ def predict_from_gridfs():
                     "timestamp": ts
                 }}}
             )
+            app.logger.info(f"predict_from_gridfs push ack={up.acknowledged} matched={up.matched_count} modified={up.modified_count}")
         except Exception as db_err:
             app.logger.error(f"DB log error: {db_err}")
 
@@ -780,8 +848,7 @@ def _jsonify_intervention(doc):
 def list_interventions():
     uid = session.get("user_id")
     u = mongo.db.users.find_one({"_id": ObjectId(uid)}, {"_id": 0, "interventions": 1})
-    items = (u or {}).get("interventions", []
-    )
+    items = (u or {}).get("interventions", [])
     items.sort(key=lambda x: x.get("start_time", datetime.min), reverse=True)
     return jsonify([_jsonify_intervention(it) for it in items]), 200
 
@@ -823,7 +890,8 @@ def intervention_start():
         "note": note,
         "source": "ui",
     }
-    mongo.db.users.update_one({"_id": ObjectId(uid)}, {"$push": {"interventions": doc}})
+    up = mongo.db.users.update_one({"_id": ObjectId(uid)}, {"$push": {"interventions": doc}})
+    app.logger.info(f"intervention_start ack={up.acknowledged} matched={up.matched_count} modified={up.modified_count}")
     return jsonify({"iid": str(iid), "start_time": start.isoformat()}), 201
 
 @app.route("/interventions/action", methods=["POST"])
@@ -841,11 +909,12 @@ def intervention_action():
         return jsonify({"message": "Invalid iid"}), 400
 
     evt = {"at": datetime.now(timezone.utc), "action": action, "meta": data.get("meta") or {}}
-    result = mongo.db.users.update_one(
+    up = mongo.db.users.update_one(
         {"_id": ObjectId(uid), "interventions.iid": aid},
         {"$push": {"interventions.$.actions": evt}}
     )
-    if result.matched_count == 0:
+    app.logger.info(f"intervention_action ack={up.acknowledged} matched={up.matched_count} modified={up.modified_count}")
+    if up.matched_count == 0:
         return jsonify({"message": "Intervention not found"}), 404
     return jsonify({"ok": True}), 200
 
@@ -879,7 +948,7 @@ def intervention_finish():
     if duration_ms is None:
         duration_ms = server_dur
 
-    mongo.db.users.update_one(
+    up = mongo.db.users.update_one(
         {"_id": ObjectId(uid), "interventions.iid": aid},
         {"$set": {
             "interventions.$.end_time": now,
@@ -887,6 +956,7 @@ def intervention_finish():
             "interventions.$.status": outcome
         }}
     )
+    app.logger.info(f"intervention_finish ack={up.acknowledged} matched={up.matched_count} modified={up.modified_count}")
     return jsonify({"ok": True, "end_time": now.isoformat(), "duration_ms": duration_ms}), 200
 
 # ---- Debug helper ----

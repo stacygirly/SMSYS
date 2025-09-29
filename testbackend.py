@@ -718,8 +718,7 @@ def predict_from_gridfs():
             up = mongo.db.users.update_one(
                 {"_id": ObjectId(uid)},
                 {"$push": {"emotions": {
-                    "em
-                    otion": label,
+                    "emotion": label,
                     "reason": reason,
                     "features": features_map,
                     "model_prediction": mean_pred,

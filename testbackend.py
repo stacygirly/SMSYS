@@ -1,22 +1,11 @@
 # testbackend.py
-# --------------------------------------------------------------------------------------
-# Full Flask backend for SMSYS:
-# - Session auth with Flask-Login + Flask-Session (filesystem store)
-# - CORS for SPA origins (including GitHub Pages)
-# - Cookie scope adjusts by host (prod apex / Render / local)
-# - Audio ingest: WebM/OGG/WAV -> ffmpeg -> mono 16k WAV -> librosa features -> LSTM
-# - Lazy model/scaler load (prevents OOM/slow boot)
-# - User emotion logging, dashboard, interventions, optional OpenAI chat
-# - Health checks and debug endpoints (cookies, ffmpeg)
-# --------------------------------------------------------------------------------------
-
 import os
 
-# ===== Force CPU & quieter TF logs (must be set BEFORE importing tensorflow/keras) =====
+# ===== Force CPU & quieter TF logs BEFORE importing tensorflow =====
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
 
-# Load .env locally (Render injects env vars automatically)
+# Load .env locally (Render injects env vars)
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -39,17 +28,16 @@ import speech_recognition as sr
 from flask import Flask, request, jsonify, session
 from flask_cors import CORS
 from flask_pymongo import PyMongo
-from flask_login import (
-    LoginManager, UserMixin, login_user, login_required, logout_user
-)
+from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user
 from flask_session import Session
 from bson.objectid import ObjectId
 from bson.binary import Binary
+import gridfs
 
-# ==== TensorFlow import AFTER flags ====
+# Import TF after env flags
 import tensorflow as tf
 try:
-    tf.config.set_visible_devices([], "GPU")  # extra safety: hide GPUs
+    tf.config.set_visible_devices([], "GPU")
 except Exception:
     pass
 from tensorflow.keras.optimizers import Nadam
@@ -60,25 +48,24 @@ try:
 except Exception:
     OpenAI = None
 
-
-# ===================== Deployment Constants =====================
+# ========= Deployment constants =========
 PROD_DOMAIN = os.getenv("PROD_DOMAIN", "persuasive.research.cs.dal.ca")
 API_PREFIX  = os.getenv("API_PREFIX", "/smsys")
 
 ALLOWED_ORIGINS = {
-    # Local dev SPAs
+    # local dev
     "http://localhost:3000",
     "http://127.0.0.1:3000",
     "http://localhost:5173",
     "http://127.0.0.1:5173",
-    # Deployed SPAs
+    # your SPAs / hosts
     "https://stacygirly.github.io",
     "https://persuasive.research.cs.dal.ca",
-    # Backend host (harmless to include)
+    # backend host (harmless to include)
     "https://smsys.onrender.com",
 }
 
-# ===================== Flask App & Base Config =====================
+# ========= Flask app & sessions =========
 app = Flask(__name__)
 app.config.update(
     SECRET_KEY=os.getenv("FLASK_SECRET_KEY", "dev-only-fallback"),
@@ -88,17 +75,17 @@ app.config.update(
     SESSION_USE_SIGNER=True,
     SESSION_COOKIE_NAME="session",
     SESSION_COOKIE_HTTPONLY=True,
-    # Defaults for local; adjusted per-request in @before_request
+    # defaults (adjusted dynamically in @before_request)
     SESSION_COOKIE_SAMESITE="Lax",
     SESSION_COOKIE_SECURE=False,
     SESSION_COOKIE_PATH="/",
     SESSION_COOKIE_DOMAIN=None,
-    # Protect server from huge uploads
-    MAX_CONTENT_LENGTH=15 * 1024 * 1024,  # 15 MB
+    # allow up to ~25MB audio uploads
+    MAX_CONTENT_LENGTH=25 * 1024 * 1024,
 )
 Session(app)
 
-# CORS (Flask-CORS will also handle OPTIONS automatically)
+# CORS base (Flask-CORS handles OPTIONS automatically)
 CORS(
     app,
     supports_credentials=True,
@@ -108,9 +95,9 @@ CORS(
     expose_headers=["Content-Type", "Authorization"],
 )
 
-# Echo precise origin + credentials for every response
 @app.after_request
 def add_cors_headers(resp):
+    # Ensure CORS headers also on errors
     origin = request.headers.get("Origin")
     if origin in ALLOWED_ORIGINS:
         resp.headers["Access-Control-Allow-Origin"] = origin
@@ -120,15 +107,13 @@ def add_cors_headers(resp):
         resp.headers["Access-Control-Allow-Methods"] = "GET,POST,PUT,DELETE,OPTIONS"
     return resp
 
-# Dynamically scope cookie for prod apex / Render / local
 @app.before_request
-def _scope_session_cookie():
+def scope_session_cookie():
     host = (request.host or "").split(":")[0]
-    is_prod   = host.endswith(PROD_DOMAIN)         # e.g., persuasive.research.cs.dal.ca
-    is_render = host.endswith(".onrender.com")     # e.g., smsys.onrender.com
+    is_prod   = host.endswith(PROD_DOMAIN)         # api on same apex as SPA path
+    is_render = host.endswith(".onrender.com")     # api on Render, SPA on GH pages
 
     if is_prod:
-        # API under /smsys on same apex as SPA → cross-site; scope cookie to /smsys
         app.config.update(
             SESSION_COOKIE_SAMESITE="None",
             SESSION_COOKIE_SECURE=True,
@@ -136,7 +121,6 @@ def _scope_session_cookie():
             SESSION_COOKIE_PATH=API_PREFIX,
         )
     elif is_render:
-        # SPA on GitHub pages, API on Render → cross-site; host-only cookie at /
         app.config.update(
             SESSION_COOKIE_SAMESITE="None",
             SESSION_COOKIE_SECURE=True,
@@ -144,7 +128,6 @@ def _scope_session_cookie():
             SESSION_COOKIE_PATH="/",
         )
     else:
-        # Local dev
         app.config.update(
             SESSION_COOKIE_SAMESITE="Lax",
             SESSION_COOKIE_SECURE=False,
@@ -152,7 +135,7 @@ def _scope_session_cookie():
             SESSION_COOKIE_PATH="/",
         )
 
-# ===================== Logging =====================
+# ========= Logging =========
 class ShortFormatter(logging.Formatter):
     def format(self, record):
         return f"{record.levelname}: {record.getMessage()}"
@@ -164,16 +147,23 @@ app.logger.setLevel(logging.INFO)
 logging.getLogger("werkzeug").setLevel(logging.ERROR)
 logging.getLogger("pymongo").setLevel(logging.ERROR)
 
-# ===================== Mongo =====================
+# ========= Mongo =========
 mongo = PyMongo(app)
-mongo.db.users.create_index("username", unique=True)
+gfs = gridfs.GridFS(mongo.db)
+
+# Indexes / connectivity
+try:
+    mongo.db.users.create_index("username", unique=True)
+except Exception:
+    pass
+
 try:
     mongo.cx.server_info()
-    print("✅ Connected to MongoDB successfully")
+    print("✅ Connected to MongoDB")
 except Exception as e:
     print("❌ MongoDB connection failed:", e)
 
-# ===================== Login Manager =====================
+# ========= Login manager =========
 login_manager = LoginManager()
 login_manager.init_app(app)
 login_manager.login_view = "login"
@@ -193,11 +183,10 @@ def load_user(user_id):
     user = mongo.db.users.find_one({"_id": ObjectId(user_id)})
     return User(str(user["_id"]), user["username"], user["password"]) if user else None
 
-# ===================== Audio / ML =====================
+# ========= Audio / ML helpers =========
 FFMPEG = shutil.which("ffmpeg") or "ffmpeg"
 
 def _ffmpeg_to_wav(src_path, dst_path):
-    """Convert any source audio to mono 16k WAV using ffmpeg."""
     cmd = [FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
            "-i", src_path, "-ac", "1", "-ar", "16000", dst_path]
     proc = subprocess.run(cmd, capture_output=True)
@@ -205,7 +194,6 @@ def _ffmpeg_to_wav(src_path, dst_path):
         raise RuntimeError(proc.stderr.decode("utf-8", errors="ignore") or "ffmpeg failed")
 
 def extract_features(y, sr):
-    """Return 38D feature vector, or None on failure."""
     try:
         zero_crossings = np.mean(librosa.feature.zero_crossing_rate(y=y))
         spectral_centroid = np.mean(librosa.feature.spectral_centroid(y=y, sr=sr))
@@ -228,8 +216,7 @@ def extract_features(y, sr):
         app.logger.error(f"Feature extraction error: {e}")
         return None
 
-# Pacing / threshold bands
-LOW_BAND  = 0.12
+LOW_BAND = 0.12
 HIGH_BAND = 0.35
 THRESHOLD = 0.23
 
@@ -238,7 +225,7 @@ def pace_from_pred(p):
     if p <= LOW_BAND:  return "pace_up"
     return "steady"
 
-# Lazy model/scaler load
+# Lazy model/scaler (avoid boot OOM/timeout)
 _model = None
 _scaler = None
 _model_lock = Lock()
@@ -254,22 +241,67 @@ def _load_model_and_scaler():
             mdl.compile(optimizer=Nadam(), loss="binary_crossentropy", metrics=["accuracy"])
             scl = joblib.load("./recordings/finalscaler.pkl")
             _model, _scaler = mdl, scl
-            print("✅ Model & scaler loaded for inference")
+            print("✅ Model & scaler loaded")
     return _model, _scaler
 
 recognizer = sr.Recognizer()
 
-# ===================== Routes =====================
+# ========= GridFS helpers (rolling 'latest' audio) =========
+def _save_latest_audio_gridfs(user_id: str, wav_bytes: bytes, *, filename="latest.wav"):
+    """Replace user's previous latest audio in GridFS and store its id on the user doc."""
+    try:
+        u = mongo.db.users.find_one({"_id": ObjectId(user_id)}, {"latest_audio_id": 1})
+        if u and u.get("latest_audio_id"):
+            try:
+                gfs.delete(ObjectId(u["latest_audio_id"]))
+            except Exception:
+                pass
+    except Exception:
+        pass
 
+    fid = gfs.put(
+        wav_bytes,
+        filename=filename,
+        contentType="audio/wav",
+        user_id=user_id,
+        uploaded_at=datetime.now(timezone.utc),
+    )
+    mongo.db.users.update_one(
+        {"_id": ObjectId(user_id)},
+        {"$set": {"latest_audio_id": str(fid)}}
+    )
+    return str(fid)
+
+def _fetch_audio_from_gridfs_to_tempfile(audio_id: str | None, user_id: str | None):
+    """
+    If audio_id is provided, fetch that file; otherwise use the user's latest_audio_id.
+    Returns path to a temp WAV file and the GridFS id used.
+    """
+    if not audio_id and user_id:
+        u = mongo.db.users.find_one({"_id": ObjectId(user_id)}, {"latest_audio_id": 1})
+        audio_id = (u or {}).get("latest_audio_id")
+
+    if not audio_id:
+        raise FileNotFoundError("No latest_audio_id set for user and no audio_id provided.")
+
+    grid_id = ObjectId(audio_id)
+    grid_file = gfs.get(grid_id)
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+    tmp.write(grid_file.read())
+    tmp.flush()
+    tmp.close()
+    return tmp.name, str(grid_id)
+
+# ========= Routes =========
 @app.route("/")
 def home():
-    return jsonify({"message": "Backend is running"}), 200
+    return jsonify({"message": "Backend up"}), 200
 
 @app.route("/healthz")
 def healthz():
     return "ok", 200
 
-# ---------- Auth ----------
+# ---- Auth ----
 @app.route("/register", methods=["POST"])
 def register():
     data = request.json or {}
@@ -327,11 +359,27 @@ def me_alias():
     return me()
 
 @app.route("/logout", methods=["POST"])
-def logout():
+def logout_route():
+    # capture uid before clearing session
+    uid = session.get("user_id")
     try:
         logout_user()
     except Exception:
         pass
+
+    # delete user's rolling/latest audio on logout
+    try:
+        if uid:
+            u = mongo.db.users.find_one({"_id": ObjectId(uid)}, {"latest_audio_id": 1})
+            if u and u.get("latest_audio_id"):
+                try:
+                    gfs.delete(ObjectId(u["latest_audio_id"]))
+                except Exception:
+                    pass
+            mongo.db.users.update_one({"_id": ObjectId(uid)}, {"$unset": {"latest_audio_id": ""}})
+    except Exception as _e:
+        app.logger.warning(f"Could not cleanup latest_audio on logout: {_e}")
+
     session.clear()
     resp = jsonify({"message": "Logged out"})
     host = (request.host or "").split(":")[0]
@@ -355,7 +403,7 @@ def update_username():
     session["username"] = new_username
     return jsonify({"message": "Username updated successfully", "new_username": new_username}), 200
 
-# ---------- Settings / Interval Logging ----------
+# ---- Settings / interval logging ----
 @app.route("/settings/logging", methods=["GET", "POST"])
 @login_required
 def settings_logging():
@@ -402,12 +450,11 @@ def log_status():
     mongo.db.users.update_one({"_id": ObjectId(uid)}, {"$push": {"emotions": entry}})
     return jsonify(entry), 200
 
-# ---------- Prediction (WebM/OGG/WAV -> WAV -> features -> LSTM) ----------
+# ---- Prediction (upload path: WebM/OGG/WAV → WAV) ----
 @app.route("/predict_emotion", methods=["POST", "OPTIONS"])
 def predict_emotion():
-    # Preflight handled here as well to be explicit
     if request.method == "OPTIONS":
-        return ("", 204)
+        return ("", 204)  # preflight
 
     try:
         model, scaler = _load_model_and_scaler()
@@ -416,43 +463,48 @@ def predict_emotion():
         return jsonify({"error": "model_load_failed", "detail": str(e)}), 500
 
     if "file" not in request.files:
-        return jsonify({"error": "no file"}), 400
-
+        return jsonify({"error": "no_file"}), 400
     uploaded = request.files["file"]
     if not uploaded or uploaded.filename == "":
-        return jsonify({"error": "empty filename"}), 400
+        return jsonify({"error": "empty_filename"}), 400
 
     name_lower = (uploaded.filename or "").lower()
     mt = (uploaded.mimetype or "").lower()
-
-    # Best-effort container sniff (server will accept webm/ogg/wav)
     suffix = ".webm"
     if name_lower.endswith(".ogg") or "ogg" in mt: suffix = ".ogg"
     if name_lower.endswith(".wav") or "wav" in mt or "wave" in mt: suffix = ".wav"
 
     up_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix); up_tmp.close()
     wav_tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav"); wav_tmp.close()
+    wav_path = wav_tmp.name
 
     try:
         uploaded.save(up_tmp.name)
         if os.path.getsize(up_tmp.name) < 1500:
             raise RuntimeError("Uploaded file too small (likely truncated).")
 
-        # Convert to WAV (or copy-through if already WAV and ffmpeg fails)
         try:
-            _ffmpeg_to_wav(up_tmp.name, wav_tmp.name)
+            _ffmpeg_to_wav(up_tmp.name, wav_path)
         except Exception as fferr:
             if suffix == ".wav":
-                shutil.copyfile(up_tmp.name, wav_tmp.name)
+                shutil.copyfile(up_tmp.name, wav_path)
             else:
                 raise RuntimeError(str(fferr))
 
-        # Load mono WAV
-        y, sr = librosa.load(wav_tmp.name, sr=None, mono=True)
+        # (Optional) Save the normalized WAV as the user's rolling/latest audio
+        try:
+            uid = session.get("user_id")
+            if uid:
+                with open(wav_path, "rb") as f:
+                    _save_latest_audio_gridfs(uid, f.read(), filename="latest.wav")
+        except Exception as _e:
+            app.logger.warning(f"Could not store latest audio to GridFS: {_e}")
+
+        # Decode & feature windows
+        y, sr = librosa.load(wav_path, sr=None, mono=True)
         if y is None or y.size == 0:
             raise RuntimeError("Decoded audio is empty.")
 
-        # Frame into up to ~4 chunks for <=60s, or ~15-s chunks for longer
         duration = librosa.get_duration(y=y, sr=sr)
         num_frames = 4 if duration <= 60 else max(1, int(duration // 15))
         chunk_size = max(1, len(y) // num_frames)
@@ -467,15 +519,13 @@ def predict_emotion():
             last_feats = feats
             norm = scaler.transform([feats])
             x = np.expand_dims(norm, axis=2)  # (1, 38, 1)
-            yhat = model.predict(x, verbose=0)
-            preds.append(float(yhat[0][0]))
+            preds.append(float(model.predict(x, verbose=0)[0][0]))
 
         mean_pred = float(np.mean(preds))
         label = "stressed" if mean_pred >= THRESHOLD else "not stressed"
         confidence = float(max(0.0, min(1.0, abs(mean_pred - THRESHOLD) / max(THRESHOLD, 1 - THRESHOLD))))
         pace = pace_from_pred(mean_pred)
 
-        # Map last window features
         feature_names = (
             ["zero_crossings", "spectral_centroid", "spectral_bandwidth", "spectral_rolloff"] +
             [f"mfcc_{i+1}" for i in range(13)] +
@@ -488,7 +538,6 @@ def predict_emotion():
         if last_feats is not None and last_feats.size == 38:
             features_map = {k: float(v) for k, v in zip(feature_names, last_feats)}
 
-        # Optionally log to user history if logged in
         uid = session.get("user_id")
         ts = datetime.now(timezone.utc)
         if uid:
@@ -506,8 +555,8 @@ def predict_emotion():
                         "timestamp": ts
                     }}}
                 )
-            except Exception as db_err:
-                app.logger.error(f"DB log error: {db_err}")
+            except Exception as e:
+                app.logger.error(f"DB log error: {e}")
 
         return jsonify({
             "emotion": label,
@@ -520,20 +569,128 @@ def predict_emotion():
         }), 200
 
     except RuntimeError as e:
-        # 415 helps frontend distinguish decode/format issues
         return jsonify({"error": "decode_failed", "detail": str(e)}), 415
     except Exception as e:
         app.logger.exception("predict_emotion crashed")
         return jsonify({"error": "server_error", "detail": str(e)}), 500
     finally:
-        for p in (up_tmp.name, wav_tmp.name):
+        for p in (up_tmp.name, wav_path):
             try:
                 if p and os.path.exists(p):
                     os.remove(p)
             except Exception:
                 pass
 
-# ---------- Optional Chat (only if OPENAI_API_KEY is present) ----------
+# ---- Prediction by pulling WAV from GridFS (no upload) ----
+@app.route("/predict_from_gridfs", methods=["POST"])
+@login_required
+def predict_from_gridfs():
+    """
+    Predict emotion by PULLING audio from MongoDB GridFS.
+    Body: { "audio_id": "<optional GridFS id or 'latest'>" }
+          If omitted or "latest", we use users.latest_audio_id.
+    """
+    try:
+        model, scaler = _load_model_and_scaler()
+    except Exception as e:
+        app.logger.exception("Model load failed")
+        return jsonify({"error": "model_load_failed", "detail": str(e)}), 500
+
+    data = request.get_json(silent=True) or {}
+    audio_id = data.get("audio_id")
+    if audio_id == "latest":
+        audio_id = None
+
+    uid = session.get("user_id")
+    if not uid:
+        return jsonify({"error": "not_logged_in"}), 401
+
+    wav_path = None
+    try:
+        wav_path, used_id = _fetch_audio_from_gridfs_to_tempfile(audio_id, uid)
+
+        y, sr = librosa.load(wav_path, sr=None, mono=True)
+        if y is None or y.size == 0:
+            raise RuntimeError("Decoded audio is empty.")
+
+        duration = librosa.get_duration(y=y, sr=sr)
+        num_frames = 4 if duration <= 60 else max(1, int(duration // 15))
+        chunk_size = max(1, len(y) // num_frames)
+
+        preds, last_feats = [], None
+        for i in range(num_frames):
+            s = i * chunk_size
+            e = (i + 1) * chunk_size if i < num_frames - 1 else len(y)
+            feats = extract_features(y[s:e], sr)
+            if feats is None or feats.size != 38:
+                return jsonify({"error": "feature_extraction_failed"}), 500
+            last_feats = feats
+            norm = scaler.transform([feats])
+            x = np.expand_dims(norm, axis=2)
+            preds.append(float(model.predict(x, verbose=0)[0][0]))
+
+        mean_pred = float(np.mean(preds))
+        label = "stressed" if mean_pred >= THRESHOLD else "not stressed"
+        confidence = float(max(0.0, min(1.0, abs(mean_pred - THRESHOLD) / max(THRESHOLD, 1 - THRESHOLD))))
+        pace = pace_from_pred(mean_pred)
+
+        feature_names = (
+            ["zero_crossings", "spectral_centroid", "spectral_bandwidth", "spectral_rolloff"] +
+            [f"mfcc_{i+1}" for i in range(13)] +
+            [f"chroma_{i+1}" for i in range(12)] +
+            ["intensity"] +
+            [f"spectral_contrast_{i+1}" for i in range(7)] +
+            ["speech_rate"]
+        )
+        features_map = {}
+        if last_feats is not None and last_feats.size == 38:
+            features_map = {k: float(v) for k, v in zip(feature_names, last_feats)}
+
+        ts = datetime.now(timezone.utc)
+        reason = "Prediction from GridFS"
+        try:
+            mongo.db.users.update_one(
+                {"_id": ObjectId(uid)},
+                {"$push": {"emotions": {
+                    "emotion": label,
+                    "reason": reason,
+                    "features": features_map,
+                    "model_prediction": mean_pred,
+                    "confidence": confidence,
+                    "pace": pace,
+                    "source": "prediction_gridfs",
+                    "timestamp": ts
+                }}}
+            )
+        except Exception as db_err:
+            app.logger.error(f"DB log error: {db_err}")
+
+        return jsonify({
+            "emotion": label,
+            "model_prediction": mean_pred,
+            "confidence": confidence,
+            "pace_suggestion": pace,
+            "reason": reason,
+            "timestamp": ts.isoformat(),
+            "features": features_map,
+            "audio_id_used": used_id
+        }), 200
+
+    except gridfs.NoFile:
+        return jsonify({"error": "not_found", "detail": "Audio not found in GridFS"}), 404
+    except FileNotFoundError as e:
+        return jsonify({"error": "no_latest_audio", "detail": str(e)}), 404
+    except Exception as e:
+        app.logger.exception("predict_from_gridfs crashed")
+        return jsonify({"error": "server_error", "detail": str(e)}), 500
+    finally:
+        if wav_path:
+            try:
+                os.remove(wav_path)
+            except Exception:
+                pass
+
+# ---- Optional chat (only if OPENAI_API_KEY) ----
 _openai = OpenAI(api_key=os.getenv("OPENAI_API_KEY")) if OpenAI and os.getenv("OPENAI_API_KEY") else None
 
 @app.route("/chat", methods=["POST"])
@@ -548,10 +705,8 @@ def chat():
     try:
         resp = _openai.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant focused on stress/wellbeing."},
-                {"role": "user", "content": msg},
-            ],
+            messages=[{"role": "system", "content": "You are a helpful assistant focused on stress/wellbeing."},
+                      {"role": "user", "content": msg}],
         )
         out = resp.choices[0].message.content
         mongo.db.chats.insert_one({
@@ -571,7 +726,7 @@ def chats():
     rows = mongo.db.chats.find({"user_id": ObjectId(uid)})
     return jsonify([{"messages": r["messages"], "timestamp": r["timestamp"]} for r in rows]), 200
 
-# ---------- Emotions Data ----------
+# ---- Emotions data ----
 @app.route("/user_emotions", methods=["GET"])
 def user_emotions():
     uid = session.get("user_id")
@@ -592,7 +747,7 @@ def stress_dashboard():
     data.sort(key=lambda e: e.get("timestamp", ""), reverse=True)
     return jsonify(data), 200
 
-# ---------- Interventions ----------
+# ---- Interventions ----
 ALLOWED_INTERVENTIONS = {"breathing", "break", "dietVoice", "chatbot"}
 
 def _parse_iso(ts):
@@ -625,7 +780,8 @@ def _jsonify_intervention(doc):
 def list_interventions():
     uid = session.get("user_id")
     u = mongo.db.users.find_one({"_id": ObjectId(uid)}, {"_id": 0, "interventions": 1})
-    items = (u or {}).get("interventions", [])
+    items = (u or {}).get("interventions", []
+    )
     items.sort(key=lambda x: x.get("start_time", datetime.min), reverse=True)
     return jsonify([_jsonify_intervention(it) for it in items]), 200
 
@@ -634,7 +790,6 @@ def list_interventions():
 def intervention_start():
     uid = session.get("user_id")
     data = request.json or {}
-
     itype = (data.get("type") or "").strip()
     if itype not in ALLOWED_INTERVENTIONS:
         return jsonify({"message": f"type must be one of {sorted(ALLOWED_INTERVENTIONS)}"}), 400
@@ -734,7 +889,7 @@ def intervention_finish():
     )
     return jsonify({"ok": True, "end_time": now.isoformat(), "duration_ms": duration_ms}), 200
 
-# ---------- Debug helpers ----------
+# ---- Debug helper ----
 @app.route("/debug/cookies")
 def debug_cookies():
     return jsonify({
@@ -744,25 +899,11 @@ def debug_cookies():
         "path": request.path,
     })
 
-@app.route("/debug/ffmpeg")
-def debug_ffmpeg():
-    import shutil as _sh
-    path = _sh.which("ffmpeg")
-    ver = None
-    try:
-        out = subprocess.run([path or "ffmpeg", "-version"], capture_output=True, text=True, timeout=5)
-        ver = out.stdout.splitlines()[0] if out.returncode == 0 else out.stderr.splitlines()[0]
-    except Exception as e:
-        ver = str(e)
-    return jsonify({"which": path, "version": ver}), 200
-
-# ---------- Error handlers ----------
+# ========= Error handlers =========
 @app.errorhandler(413)
 def too_large(_e):
     return jsonify({"error": "payload_too_large"}), 413
 
-# ===================== Entrypoint =====================
+# ========= Entrypoint =========
 if __name__ == "__main__":
-    # For local dev only; on Render use gunicorn start command:
-    # gunicorn -b 0.0.0.0:$PORT testbackend:app --timeout 120 --workers 1 --threads 4 --keep-alive 120
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)
